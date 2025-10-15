@@ -1,0 +1,7 @@
+# Gradi Calibration artifacts
+assets/*
+!assets/**/README.txt
+pc_app/__pycache__/
+**/*.pyc
+.DS_Store
+AGENTS.md
