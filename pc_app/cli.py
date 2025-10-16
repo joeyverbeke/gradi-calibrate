@@ -27,7 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-auto-tare",
         action="store_true",
-        help="Disable automatic tare request on startup (useful if the device cannot be docked).",
+        help="Disable automatic dock tare requests while the wearable is idle.",
     )
     parser.add_argument(
         "--local-audio",

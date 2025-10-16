@@ -76,20 +76,32 @@ class SessionController:
         self._last_bucket_eval: Optional[buckets.BucketDecision] = None
         self._last_bucket_output: Optional[str] = None
         self._auto_tare = auto_tare
-        self._tare_sent = False
-        self._tared = False
+        self._device_state: Optional[str] = None
+        self._pending_tare: bool = auto_tare
+        self._last_tare_attempt: float = 0.0
+        self._tare_retry_interval_sec: float = 1.0
 
     def run_forever(self) -> None:
         logger.info("Starting session loop; press Ctrl+C to exit.")
         try:
+            self._send_idle_safe()
             while True:
                 self._poll_device()
+                if self._auto_tare:
+                    self._process_tare(time.monotonic())
                 self._tick()
                 time.sleep(0.05)
         except KeyboardInterrupt:
             logger.info("Session loop interrupted by user.")
+            self._send_idle_safe()
         finally:
             self._link.close()
+
+    def _send_idle_safe(self) -> None:
+        try:
+            self._link.send_idle()
+        except Exception as exc:
+            logger.debug("Failed to send IDLE command: %s", exc)
 
     def _start_session(self) -> None:
         dt = datetime.now(timezone.utc)
@@ -125,6 +137,17 @@ class SessionController:
             self._link.send_target_vector(self._state.target_vector)
             self._state.last_target_broadcast = now
 
+    def _process_tare(self, now: float) -> None:
+        if not self._pending_tare:
+            return
+        if self._device_state != "idle":
+            return
+        if now - self._last_tare_attempt < self._tare_retry_interval_sec:
+            return
+        logger.info("Requesting dock tare.")
+        self._link.send_tare()
+        self._last_tare_attempt = now
+
     def _compute_output_label_from_decision(self, decision: buckets.BucketDecision) -> str:
         label = decision.label
         if not ALLOW_DIAGONAL_BUCKETS and label in _DIAGONAL_LABELS:
@@ -149,25 +172,31 @@ class SessionController:
             event = message.get("event")
 
             if state == "motion_start":
+                self._device_state = "motion_start"
                 if not self._state.active:
                     self._start_session()
                 continue
             if state == "idle":
+                self._device_state = "idle"
+                if self._auto_tare:
+                    self._pending_tare = True
                 if self._state.active:
                     self._end_session()
                 continue
             if state == "guiding" and not self._state.active:
                 # Device already active; align our state.
                 self._start_session()
+            if state == "guiding":
+                self._device_state = "guiding"
 
             if event:
                 if event == "tared":
-                    self._tared = True
                     logger.info("Wearable tare acknowledged.")
+                    self._pending_tare = False
                 elif event == "tare_wait":
                     logger.info("Wearable needs orientation before tare completes.")
-                    self._tare_sent = False
-                continue
+                    # keep pending true; allow retry after cooldown
+                    continue
 
             orientation = message.get("orientation")
             euler = message.get("euler")
@@ -180,10 +209,6 @@ class SessionController:
                     ),
                     "euler": euler,
                 }
-                if self._auto_tare and not self._tare_sent:
-                    logger.info("Auto-tare: sending TARE command.")
-                    self._link.send_tare()
-                    self._tare_sent = True
                 if self._state.target_vector:
                     aim_vec = (
                         orientation.get("east", 0.0),
@@ -200,9 +225,10 @@ class SessionController:
                 print(self._format_bucket_debug(bucket_label))
                 self._audio.play_bucket(bucket_label)
                 decision = self._last_bucket_eval
-                expected = self._last_bucket_output or (
-                    decision and self._compute_output_label_from_decision(decision)
-                )
+                expected = self._last_bucket_output
+                if not expected and decision:
+                    computed_label = self._compute_output_label_from_decision(decision)
+                    expected = computed_label
                 if decision and expected and bucket_label != expected:
                     logger.debug(
                         "Bucket mismatch (device=%s local=%s | yaw=%.2f pitch=%.2f)",

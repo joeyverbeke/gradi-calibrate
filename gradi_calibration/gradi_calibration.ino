@@ -51,7 +51,7 @@ struct Mat3 {
   float m[3][3];
 };
 
-constexpr Vector3 V_ARM_SENS = {0.0f, -1.0f, 0.0f};              // Board -Y points down the wearer’s arm.
+constexpr Vector3 V_ARM_SENS = {0.0f, 1.0f, 0.0f};               // Board +Y points down the wearer’s arm.
 constexpr Vector3 DOCK_FORWARD_WORLD = {0.0f, 1.0f, 0.0f};       // Device points north in the dock pose.
 constexpr Vector3 WORLD_UP = {0.0f, 0.0f, 1.0f};
 const Mat3 MAT3_IDENTITY = {{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}};
@@ -360,7 +360,7 @@ void transitionToIdle() {
 }
 
 Vector3 eulerToForward(const EulerAngles &angles) {
-  float yawTrue = angles.yaw + MAG_DECLINATION_DEG;
+  float yawTrue = MAG_DECLINATION_DEG - angles.yaw;
   Mat3 R_world_from_sensor = rotmatZYX_deg(yawTrue, angles.pitch, angles.roll);
   Vector3 forwardWorld = matMulVec(R_world_from_sensor, V_ARM_SENS);
   return normalize(forwardWorld);
