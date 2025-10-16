@@ -29,7 +29,7 @@ Requires Python 3.10+ available to `uv`.
    uv pip install -r requirements.txt
    ```
 
-   (For now the only runtime dependency is `pyserial`; add additional packages to `requirements.txt` as the project grows.)
+   (Runtime dependencies include `pyserial` for USB comms and `simpleaudio` for optional local playback; add additional packages to `requirements.txt` as the project grows.)
 
 ### Running
 
@@ -38,6 +38,7 @@ python -m pc_app.cli --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-leve
 ```
 
 - Omit `--audio` for the terminal-only pass (default). Add `--audio` once the firmware can render streamed audio.
+- Combine `--audio` with `--local-audio` to play prompts on the host (WAV files only; installs `simpleaudio` via `requirements.txt`).
 - Leave auto-tare enabled (default) when the device starts docked; pass `--no-auto-tare` if you need to handle the tare manually.
 - Adjust `--cadence` to change the prompt interval (seconds).
 - If you want a different default serial port or cadence, edit `pc_app/constants.py` or use environment-specific CLI overrides.

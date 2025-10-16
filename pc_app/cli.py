@@ -17,7 +17,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default=None, help="Serial port connected to the wearable (default: auto)")
     parser.add_argument("--lat", type=float, default=37.7749, help="Observer latitude in degrees")
     parser.add_argument("--lon", type=float, default=-122.4194, help="Observer longitude in degrees (east positive)")
-    parser.add_argument("--audio", action="store_true", help="Enable asset streaming to the wearable")
+    parser.add_argument(
+        "--audio",
+        action="store_true",
+        help="Enable prompt playback; combine with --local-audio to loop audio locally instead of streaming.",
+    )
     parser.add_argument("--cadence", type=float, default=GUIDANCE_INTERVAL_SEC, help="Guidance cadence in seconds")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (DEBUG, INFO, ...)")
     parser.add_argument(
@@ -25,12 +29,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable automatic tare request on startup (useful if the device cannot be docked).",
     )
+    parser.add_argument(
+        "--local-audio",
+        action="store_true",
+        help="Play bucket audio on the desktop (requires --audio); nothing is streamed to the wearable.",
+    )
     return parser
 
 
 def run_app() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.local_audio and not args.audio:
+        parser.error("--local-audio requires --audio")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -40,7 +52,7 @@ def run_app() -> None:
     port = args.port
     link = DeviceLink(port=port) if port else DeviceLink()
     location = ObserverLocation(latitude_deg=args.lat, longitude_deg=args.lon)
-    audio = AudioPlayer(link=link, enabled=args.audio)
+    audio = AudioPlayer(link=link, enabled=args.audio, local_only=args.local_audio)
     controller = SessionController(
         link=link,
         audio=audio,

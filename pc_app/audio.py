@@ -1,4 +1,4 @@
-"""Audio asset management and streaming."""
+"""Audio asset management and playback."""
 
 from __future__ import annotations
 
@@ -25,20 +25,38 @@ def _find_first_audio_file(directory: Path) -> Optional[Path]:
 
 
 class AudioPlayer:
-    """Loads TTS assets from disk and streams them to the wearable."""
+    """Loads TTS assets from disk and either streams them to the wearable or plays them locally."""
 
-    def __init__(self, link: DeviceLink, assets_root: Path = ASSETS_BASE_PATH, enabled: bool = False) -> None:
+    def __init__(
+        self,
+        link: DeviceLink,
+        assets_root: Path = ASSETS_BASE_PATH,
+        enabled: bool = False,
+        local_only: bool = False,
+    ) -> None:
         self._link = link
         self._assets_root = assets_root
         self._enabled = enabled
+        self._local_only = local_only and enabled
         if enabled:
-            logger.info("Audio playback enabled via assets in %s", assets_root)
+            if self._local_only:
+                logger.info("Audio playback enabled locally via assets in %s", assets_root)
+            else:
+                logger.info("Audio playback enabled via assets in %s (streaming to device)", assets_root)
         else:
             logger.info("Audio playback disabled; running in terminal-only mode.")
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def local_only(self) -> bool:
+        return self._local_only
+
+    @property
+    def should_stream(self) -> bool:
+        return self._enabled and not self._local_only
 
     def play_intro(self, planet: str) -> None:
         if not self._enabled:
@@ -49,7 +67,7 @@ class AudioPlayer:
         if not path:
             logger.warning("No intro audio found in %s", directory)
             return
-        self._stream_file(path, label=f"intro_{planet}")
+        self._play_or_stream(path, label=f"intro_{planet}")
 
     def play_outro(self) -> None:
         if not self._enabled:
@@ -60,7 +78,7 @@ class AudioPlayer:
         if not path:
             logger.warning("No outro audio found in %s", directory)
             return
-        self._stream_file(path, label="outro")
+        self._play_or_stream(path, label="outro")
 
     def play_bucket(self, bucket: str) -> None:
         if not self._enabled:
@@ -71,7 +89,13 @@ class AudioPlayer:
         if not path:
             logger.warning("Missing audio for bucket %s (looked in %s)", bucket, directory)
             return
-        self._stream_file(path, label=bucket)
+        self._play_or_stream(path, label=bucket)
+
+    def _play_or_stream(self, path: Path, label: str) -> None:
+        if self._local_only:
+            self._play_locally(path, label)
+        else:
+            self._stream_file(path, label)
 
     def _stream_file(self, path: Path, label: str) -> None:
         logger.info("Streaming %s (%s)", label, path.name)
@@ -85,3 +109,32 @@ class AudioPlayer:
             offset += len(chunk)
             final = offset >= len(data)
             self._link.stream_audio_chunk(label, chunk, final)
+
+    def _play_locally(self, path: Path, label: str) -> None:
+        try:
+            import simpleaudio  # type: ignore
+            import wave
+        except ImportError:
+            logger.warning("Local audio playback requested but simpleaudio is not installed.")
+            return
+
+        if path.suffix.lower() != ".wav":
+            logger.warning("Local playback currently supports WAV files only (%s skipped).", path.name)
+            return
+
+        try:
+            with wave.open(str(path), "rb") as wav_handle:
+                num_channels = wav_handle.getnchannels()
+                sample_width = wav_handle.getsampwidth()
+                sample_rate = wav_handle.getframerate()
+                audio_data = wav_handle.readframes(wav_handle.getnframes())
+            logger.info("Playing %s locally (%s)", label, path.name)
+            play_obj = simpleaudio.play_buffer(
+                audio_data,
+                num_channels=num_channels,
+                bytes_per_sample=sample_width,
+                sample_rate=sample_rate,
+            )
+            play_obj.wait_done()
+        except Exception as exc:  # pragma: no cover - hardware/audio dependent
+            logger.error("Failed to play %s locally: %s", path, exc)

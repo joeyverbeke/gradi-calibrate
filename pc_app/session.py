@@ -113,7 +113,7 @@ class SessionController:
         self._last_bucket_eval = None
         self._last_bucket_output = None
         logger.info("Session start: target planet %s", planet.name.capitalize())
-        self._link.send_session_start(planet.name, self._audio.enabled, self._state.cadence_sec)
+        self._link.send_session_start(planet.name, self._audio.should_stream, self._state.cadence_sec)
         self._audio.play_intro(planet.name)
 
     def _end_session(self) -> None:
