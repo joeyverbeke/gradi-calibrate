@@ -12,13 +12,20 @@ from .link import DeviceLink
 logger = logging.getLogger(__name__)
 
 STREAM_FRAMES_PER_CHUNK = 256
+_AUDIO_EXTENSIONS = (".wav", ".mp3", ".ogg", ".flac")
 
 
-def _find_first_audio_file(directory: Path) -> Optional[Path]:
+def _find_audio_file(directory: Path, base_name: Optional[str] = None) -> Optional[Path]:
     if not directory.exists():
         return None
-    for ext in ("*.wav", "*.mp3", "*.ogg", "*.flac"):
-        candidates = sorted(directory.glob(ext))
+    if base_name:
+        for ext in _AUDIO_EXTENSIONS:
+            candidate = directory / f"{base_name}{ext}"
+            if candidate.exists():
+                return candidate
+        return None
+    for ext in _AUDIO_EXTENSIONS:
+        candidates = sorted(directory.glob(f"*{ext}"))
         if candidates:
             return candidates[0]
     return None
@@ -63,7 +70,12 @@ class AudioPlayer:
             logger.info("Intro (planet=%s) suppressed in terminal-only mode.", planet)
             return
         directory = self._assets_root / "intro"
-        path = _find_first_audio_file(directory)
+        normalized = (planet or "").strip().lower()
+        base_name = f"Intro-{normalized.capitalize()}" if normalized else None
+        path = _find_audio_file(directory, base_name=base_name)
+        if not path:
+            logger.warning("No planet-specific intro found for %s in %s", planet, directory)
+            path = _find_audio_file(directory)
         if not path:
             logger.warning("No intro audio found in %s", directory)
             return
@@ -74,7 +86,7 @@ class AudioPlayer:
             logger.info("Outro suppressed in terminal-only mode.")
             return
         directory = self._assets_root / "outro"
-        path = _find_first_audio_file(directory)
+        path = _find_audio_file(directory)
         if not path:
             logger.warning("No outro audio found in %s", directory)
             return
@@ -85,7 +97,7 @@ class AudioPlayer:
             logger.debug("Bucket %s prompt suppressed in terminal-only mode.", bucket)
             return
         directory = self._assets_root / bucket
-        path = _find_first_audio_file(directory)
+        path = _find_audio_file(directory)
         if not path:
             logger.warning("Missing audio for bucket %s (looked in %s)", bucket, directory)
             return

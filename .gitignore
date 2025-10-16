@@ -5,3 +5,4 @@ pc_app/__pycache__/
 **/*.pyc
 .DS_Store
 AGENTS.md
+tools/

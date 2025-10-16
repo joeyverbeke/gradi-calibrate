@@ -667,7 +667,8 @@ void loop() {
       } else if (nearTarget) {
         stillnessStartMs = now;
       } else {
-        transitionToIdle();
+        // Wearer is still hunting; keep guiding instead of dropping to idle.
+        stillnessStartMs = now;
       }
     }
   }
