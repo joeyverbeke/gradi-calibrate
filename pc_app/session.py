@@ -17,16 +17,6 @@ from .planets import ObserverLocation, PlanetCoefficients, select_planet, target
 
 logger = logging.getLogger(__name__)
 
-_BUCKET_SWAP = {
-    "up": "down",
-    "down": "up",
-    "left": "right",
-    "right": "left",
-    "up_right": "down_left",
-    "up_left": "down_right",
-    "down_right": "up_left",
-    "down_left": "up_right",
-}
 _DIAGONAL_LABELS = {"up_right", "up_left", "down_right", "down_left"}
 _DIAGONAL_FALLBACK = {
     "up_right": "up",
@@ -139,7 +129,7 @@ class SessionController:
         label = decision.label
         if not ALLOW_DIAGONAL_BUCKETS and label in _DIAGONAL_LABELS:
             label = _collapse_decision_to_cardinal(decision)
-        return _BUCKET_SWAP.get(label, label)
+        return label
 
     def _resolve_bucket_label(self, raw_label: Optional[str]) -> Optional[str]:
         if self._last_bucket_output:
@@ -149,7 +139,7 @@ class SessionController:
         label = raw_label
         if not ALLOW_DIAGONAL_BUCKETS and label in _DIAGONAL_LABELS:
             label = _DIAGONAL_FALLBACK.get(label, label)
-        return _BUCKET_SWAP.get(label, label)
+        return label
 
     def _poll_device(self) -> None:
         for message in self._link.read_messages():

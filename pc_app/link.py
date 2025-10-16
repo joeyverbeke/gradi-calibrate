@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from .constants import SERIAL_PORT_DEFAULT, SERIAL_TIMEOUT_SEC, USB_BAUD_RATE
@@ -21,6 +22,9 @@ class DeviceLink:
         self._port_name = port
         self._baudrate = baudrate
         self._serial: Optional[Any] = None
+        self._audio_stream_active = False
+        self._audio_bytes_per_second: Optional[float] = None
+        self._audio_next_deadline: float = 0.0
 
     def connect(self) -> None:
         if serial is None:
@@ -31,6 +35,7 @@ class DeviceLink:
             self._port_name,
             baudrate=self._baudrate,
             timeout=SERIAL_TIMEOUT_SEC,
+            write_timeout=1.0,
         )
         logger.info("Opened device link on %s @ %d baud", self._port_name, self._baudrate)
 
@@ -49,6 +54,19 @@ class DeviceLink:
             self.connect()
         assert self._serial is not None
         self._serial.write((line + "\n").encode("ascii"))
+
+    def _write_raw(self, payload: bytes) -> None:
+        if not payload:
+            return
+        if not self.is_connected:
+            self.connect()
+        assert self._serial is not None
+        written = self._serial.write(payload)
+        if written != len(payload):
+            raise RuntimeError(
+                f"Short write while streaming audio ({written}/{len(payload)} bytes)"
+            )
+        self._serial.flush()
 
     def send_session_start(self, planet: str, audio_enabled: bool, cadence_sec: float) -> None:
         line = f"START planet={planet} audio={int(audio_enabled)} cadence={cadence_sec:.2f}"
@@ -75,6 +93,43 @@ class DeviceLink:
 
         encoded = base64.b64encode(payload).decode("ascii")
         self._write_line(f"AUDIO {label} {int(final)} {encoded}")
+
+    # ------------------------------------------------------------------
+    # New binary audio streaming helpers
+
+    def start_audio_stream(self, sample_rate: int, frame_count: int, label: str) -> None:
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if frame_count <= 0:
+            raise ValueError("frame_count must be positive")
+        safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label) or "clip"
+        self._write_line(f"AUDIO START {sample_rate} {frame_count} {safe_label}")
+        self._audio_stream_active = True
+        bytes_per_sample = 2  # 16-bit mono expected
+        self._audio_bytes_per_second = sample_rate * bytes_per_sample
+        self._audio_next_deadline = time.perf_counter()
+
+    def stream_audio_payload(self, payload: bytes) -> None:
+        if not self._audio_stream_active:
+            raise RuntimeError("Audio stream not started.")
+        if not payload:
+            return
+        self._write_raw(payload)
+        if self._audio_bytes_per_second:
+            self._audio_next_deadline += len(payload) / self._audio_bytes_per_second
+            sleep_time = self._audio_next_deadline - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                self._audio_next_deadline = time.perf_counter()
+
+    def finish_audio_stream(self) -> None:
+        if not self._audio_stream_active:
+            return
+        self._write_line("AUDIO END")
+        self._audio_stream_active = False
+        self._audio_bytes_per_second = None
+        self._audio_next_deadline = 0.0
 
     def read_messages(self) -> Iterable[Dict[str, Any]]:
         if not self.is_connected:

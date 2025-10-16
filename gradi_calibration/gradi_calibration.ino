@@ -6,12 +6,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <I2S.h>
 
 #ifndef RAD_TO_DEG
 #define RAD_TO_DEG (180.0f / PI)
 #endif
 
-constexpr uint32_t SERIAL_BAUD = 115200;
+constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr uint32_t GUIDANCE_INTERVAL_DEFAULT_MS = 1500;
 constexpr float ORIENTATION_SMOOTH_ALPHA = 0.2f;
 constexpr float MOTION_START_THRESHOLD_DEG = 0.4f;
@@ -23,6 +24,16 @@ constexpr float MIN_DIAGONAL_DEG = 12.0f;
 constexpr float MICRO_ADJUST_DEG = 1.0f;
 constexpr float DOCK_ALIGNMENT_THRESHOLD_DEG = 8.0f;
 constexpr float NEAR_TARGET_ANGLE_DEG = 5.0f;
+
+constexpr int PIN_I2S_BCLK = 3;      // D10 / P3 -> MAX98357A BCLK
+constexpr int PIN_I2S_LRCLK = 4;     // D9  / P4 -> MAX98357A LRC
+constexpr int PIN_I2S_DATA = 2;      // D8  / P2 -> MAX98357A DIN
+constexpr int PIN_AMP_ENABLE = 6;    // D6  / P0 -> MAX98357A SD (active high)
+constexpr size_t AUDIO_BUFFER_SAMPLES = 256;
+constexpr uint8_t AUDIO_SAMPLE_BITS = 16;
+constexpr uint8_t AUDIO_BYTES_PER_SAMPLE = AUDIO_SAMPLE_BITS / 8;
+
+static I2S i2s(OUTPUT);
 
 struct Vector3 {
   float east;
@@ -70,6 +81,19 @@ bool audioEnabled = false;
 char currentPlanet[16] = "unknown";
 Mat3 R_align = MAT3_IDENTITY;
 size_t microCycleIndex = 0;
+
+enum AudioStreamMode {
+  AUDIO_STREAM_IDLE,
+  AUDIO_STREAM_RECEIVING,
+  AUDIO_STREAM_WAITING_END
+};
+
+AudioStreamMode audioStreamMode = AUDIO_STREAM_IDLE;
+uint32_t audioSamplesRemaining = 0;
+size_t audioBufferFill = 0;
+int16_t audioBuffer[AUDIO_BUFFER_SAMPLES];
+bool audioOutputConfigured = false;
+uint32_t audioCurrentSampleRateHz = 0;
 
 float clampf(float value, float minVal, float maxVal) {
   if (value < minVal) return minVal;
@@ -173,6 +197,119 @@ Mat3 rotationBetween(const Vector3 &from, const Vector3 &to) {
   return axisAngleMatrix(axis, angle);
 }
 
+bool configureAudioOutput(uint32_t sampleRate) {
+  if (sampleRate == 0) {
+    return false;
+  }
+
+  if (audioOutputConfigured && audioCurrentSampleRateHz == sampleRate) {
+    return true;
+  }
+
+  if (audioOutputConfigured) {
+    i2s.end();
+    audioOutputConfigured = false;
+    audioCurrentSampleRateHz = 0;
+  }
+
+  i2s.setBCLK(PIN_I2S_BCLK);
+  i2s.setDATA(PIN_I2S_DATA);
+  i2s.setBitsPerSample(AUDIO_SAMPLE_BITS);
+
+  if (!i2s.begin(static_cast<long>(sampleRate))) {
+    Serial.println(F("LOG audio_i2s_begin_failed"));
+    return false;
+  }
+
+  audioOutputConfigured = true;
+  audioCurrentSampleRateHz = sampleRate;
+  return true;
+}
+
+void resetAudioStreamState() {
+  audioStreamMode = AUDIO_STREAM_IDLE;
+  audioSamplesRemaining = 0;
+  audioBufferFill = 0;
+}
+
+void flushAudioBuffer() {
+  if (audioBufferFill == 0) {
+    return;
+  }
+  if (!audioOutputConfigured) {
+    audioBufferFill = 0;
+    return;
+  }
+  for (size_t i = 0; i < audioBufferFill; ++i) {
+    int16_t s = audioBuffer[i];
+    while (!i2s.write16(s, s)) {
+      delayMicroseconds(50);
+    }
+  }
+  audioBufferFill = 0;
+}
+
+bool pumpAudioStream() {
+  if (audioStreamMode != AUDIO_STREAM_RECEIVING) {
+    return false;
+  }
+
+  bool consumed = false;
+  while (audioSamplesRemaining > 0 && Serial.available() >= AUDIO_BYTES_PER_SAMPLE) {
+    int first = Serial.read();
+    int second = Serial.read();
+    if (first < 0 || second < 0) {
+      break;
+    }
+    int16_t sample = static_cast<int16_t>(first | (second << 8));
+    audioBuffer[audioBufferFill++] = sample;
+    audioSamplesRemaining--;
+    consumed = true;
+    if (audioBufferFill >= AUDIO_BUFFER_SAMPLES) {
+      flushAudioBuffer();
+    }
+  }
+
+  if (audioSamplesRemaining == 0 && audioStreamMode == AUDIO_STREAM_RECEIVING) {
+    flushAudioBuffer();
+    audioStreamMode = AUDIO_STREAM_WAITING_END;
+  }
+
+  return consumed;
+}
+
+void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const char *label) {
+  resetAudioStreamState();
+  if (frameCount == 0 || sampleRate == 0) {
+    return;
+  }
+
+  bool shouldPlay = audioEnabled && configureAudioOutput(sampleRate);
+  if (!shouldPlay) {
+    audioOutputConfigured = false;
+  }
+
+  audioSamplesRemaining = frameCount;
+  audioStreamMode = AUDIO_STREAM_RECEIVING;
+  audioBufferFill = 0;
+  if (shouldPlay) {
+    Serial.print(F("LOG audio_start "));
+    if (label && *label) {
+      Serial.println(label);
+    } else {
+      Serial.println(sampleRate);
+    }
+  } else {
+    Serial.println(F("LOG audio_skip"));
+  }
+}
+
+void handleAudioEndCommand() {
+  flushAudioBuffer();
+  Serial.println(F("LOG audio_end"));
+  resetAudioStreamState();
+}
+
 void sendState(const char *state) {
   Serial.print(F("STATE "));
   Serial.println(state);
@@ -214,7 +351,6 @@ void setMode(DeviceMode mode) {
 
 void transitionToIdle() {
   targetValid = false;
-  audioEnabled = false;
   currentPlanet[0] = '\0';
   guidanceIntervalMs = GUIDANCE_INTERVAL_DEFAULT_MS;
   lastGuidanceMs = 0;
@@ -426,7 +562,24 @@ void handleSerialLine(char *line) {
   }
 
   if (strncmp(line, "AUDIO", 5) == 0) {
-    // Audio streaming not implemented yet; ignore payload.
+    const char *args = line + 5;
+    while (*args == ' ') {
+      ++args;
+    }
+    if (strncmp(args, "START", 5) == 0) {
+      unsigned long sampleRate = 0;
+      unsigned long frameCount = 0;
+      char label[24] = {0};
+      int matched = sscanf(args + 5, "%lu %lu %23s", &sampleRate, &frameCount, label);
+      if (matched >= 2) {
+        const char *labelPtr = (matched >= 3) ? label : nullptr;
+        handleAudioStartCommand(static_cast<uint32_t>(sampleRate), static_cast<uint32_t>(frameCount), labelPtr);
+      } else {
+        Serial.println(F("LOG audio_start_parse_error"));
+      }
+    } else if (strncmp(args, "END", 3) == 0) {
+      handleAudioEndCommand();
+    }
     return;
   }
 }
@@ -434,7 +587,21 @@ void handleSerialLine(char *line) {
 void pollSerial() {
   static char buffer[160];
   static size_t index = 0;
-  while (Serial.available()) {
+  while (true) {
+    if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
+      bool consumed = pumpAudioStream();
+      if (!consumed) {
+        break;
+      }
+      if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
+        continue;
+      }
+    }
+
+    if (!Serial.available()) {
+      break;
+    }
+
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (index == 0) {
@@ -459,6 +626,10 @@ void setup() {
   }
   sendState("idle");
 
+  pinMode(PIN_AMP_ENABLE, OUTPUT);
+  digitalWrite(PIN_AMP_ENABLE, HIGH);
+  resetAudioStreamState();
+
   Serial1.begin(115200);
   while (!Serial1) {
     delay(10);
@@ -473,6 +644,10 @@ void setup() {
 }
 
 void loop() {
+  if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
+    pumpAudioStream();
+  }
+
   pollSerial();
 
   uint32_t now = millis();

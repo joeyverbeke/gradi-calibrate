@@ -3,7 +3,7 @@
 from pathlib import Path
 
 # Prompt cadence in seconds while guidance is active.
-GUIDANCE_INTERVAL_SEC: float = 0.5
+GUIDANCE_INTERVAL_SEC: float = 1.5
 
 # Minimum time between idle checks to avoid bouncing in and out of Idle.
 IDLE_CHECK_INTERVAL_SEC: float = 0.2
@@ -30,7 +30,7 @@ BUCKET_LABELS = [
 ALLOW_DIAGONAL_BUCKETS: bool = False
 
 # Serial transport configuration.
-USB_BAUD_RATE: int = 115200
+USB_BAUD_RATE: int = 921600
 SERIAL_PORT_DEFAULT = "/dev/ttyACM0"
 SERIAL_TIMEOUT_SEC: float = 0.1
 

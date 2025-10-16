@@ -11,7 +11,7 @@ from .link import DeviceLink
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 512
+STREAM_FRAMES_PER_CHUNK = 256
 
 
 def _find_first_audio_file(directory: Path) -> Optional[Path]:
@@ -98,17 +98,68 @@ class AudioPlayer:
             self._stream_file(path, label)
 
     def _stream_file(self, path: Path, label: str) -> None:
-        logger.info("Streaming %s (%s)", label, path.name)
-        data = path.read_bytes()
-        offset = 0
-        if not data:
-            logger.warning("Audio file %s is empty.", path)
-            return
-        while offset < len(data):
-            chunk = data[offset : offset + CHUNK_SIZE]
-            offset += len(chunk)
-            final = offset >= len(data)
-            self._link.stream_audio_chunk(label, chunk, final)
+        import wave
+
+        stream_started = False
+        try:
+            with wave.open(str(path), "rb") as wav_handle:
+                num_channels = wav_handle.getnchannels()
+                sample_width = wav_handle.getsampwidth()
+                sample_rate = wav_handle.getframerate()
+                frame_count = wav_handle.getnframes()
+
+                if frame_count <= 0:
+                    logger.warning("Audio file %s has no frames.", path.name)
+                    return
+                if num_channels != 1:
+                    logger.error(
+                        "Only mono WAV files are supported for streaming (%s has %d channels).",
+                        path.name,
+                        num_channels,
+                    )
+                    return
+                if sample_width != 2:
+                    logger.error(
+                        "Audio file %s must be 16-bit PCM (sample width=%d bytes).",
+                        path.name,
+                        sample_width,
+                    )
+                    return
+
+                logger.info(
+                    "Streaming %s (%s @ %d Hz, %d frames)",
+                    label,
+                    path.name,
+                    sample_rate,
+                    frame_count,
+                )
+                self._link.start_audio_stream(sample_rate, frame_count, label)
+                stream_started = True
+                frames_per_chunk = STREAM_FRAMES_PER_CHUNK
+                bytes_per_frame = sample_width * num_channels
+                while True:
+                    chunk = wav_handle.readframes(frames_per_chunk)
+                    if not chunk:
+                        break
+                    if len(chunk) % bytes_per_frame != 0:
+                        # Guard against partial frames introduced by the decoder.
+                        valid_len = len(chunk) - (len(chunk) % bytes_per_frame)
+                        if valid_len == 0:
+                            continue
+                        chunk = chunk[:valid_len]
+                    self._link.stream_audio_payload(chunk)
+        except FileNotFoundError:
+            logger.error("Audio file %s not found.", path.name)
+        except wave.Error as exc:
+            logger.error("Failed to read WAV metadata from %s: %s", path.name, exc)
+        except Exception as exc:  # pragma: no cover - serial/hardware dependent
+            logger.error("Failed to stream %s: %s", path.name, exc)
+        finally:
+            if stream_started:
+                try:
+                    self._link.finish_audio_stream()
+                except Exception as exc:  # pragma: no cover - serial/hardware dependent
+                    logger.error("Failed to finalize audio stream for %s: %s", label, exc)
 
     def _play_locally(self, path: Path, label: str) -> None:
         try:

@@ -51,7 +51,7 @@ Source: `gradi_calibration/gradi_calibration.ino`
 
 1. Open the sketch in the Arduino IDE (or use `arduino-cli`) targeting the Seeed XIAO RP2040.
 2. Ensure the Adafruit `BNO08x_RVC` library is installed.
-3. Flash the board; the firmware talks to the BNO08x via `Serial1` at 115200 baud and communicates with the host over USB CDC.
+3. Flash the board; the firmware talks to the BNO08x via `Serial1` at 115200 baud and communicates with the host over USB CDC at 921600 baud to sustain PCM streaming.
 
 The firmware removes the legacy LED/haptic game and implements:
 
@@ -59,17 +59,31 @@ The firmware removes the legacy LED/haptic game and implements:
 - ENU forward-vector smoothing (`ORIENTATION_SMOOTH_ALPHA`) with a dock-side tare to compensate mounting bias.
 - Body-relative guidance that never settles in a “center” state; diagonals can be disabled via `ALLOW_DIAGONAL_BUCKETS` to force pure left/right/up/down prompts.
 - Idle transitions check for the dock pose (`DOCK_FORWARD_WORLD` within `DOCK_ALIGNMENT_THRESHOLD_DEG`) and ignore “micro adjustment” stillness when the wearer is already close to the target.
-- Serial protocol: `STATE`, `BUCKET`, `ORIENT`, plus `EVENT tared`/`tare_wait` notifications.
-- Host commands handled today: `TARE`, `START`, `TARGET`, `END`, and stubbed `AUDIO` (audio frames ignored until MAX98357A playback is wired up).
+- Serial protocol: `STATE`, `BUCKET`, `ORIENT`, plus `EVENT tared`/`tare_wait` notifications (and `LOG audio_*` helpers while streaming clips).
+- Host commands handled today: `TARE`, `START`, `TARGET`, `END`, and `AUDIO START <sample_rate_hz> <frame_count> <label>` / `AUDIO END` for 16-bit mono PCM streaming. After `START` the RP2040 configures I2S (`BCLK=D10`, `LRCLK=D9`, `DIN=D8`, `SD=D6`) and feeds the MAX98357A directly.
 - Calibrate for your install:
   - Set `MAG_DECLINATION_DEG` to the local magnetic declination (east-positive; e.g. Seoul ≈ `-8.28f` in Oct 2025).
   - Adjust `DOCK_FORWARD_WORLD` so the docked finger vector matches the real-world heading during tare (`{0,1,0}` = north, `{1,0,0}` = east, etc.).
 
 Adjust the thresholds and cadence defaults in the sketch to tune responsiveness (see `TUNABLES.md`).
 
+## MAX98357A Wiring
+
+| MAX98357A | XIAO RP2040 | Notes |
+| --- | --- | --- |
+| VIN | 3V3 or 5V | Module tolerates 3–5 V supply (share board power). |
+| GND | GND | Common ground with the wearable. |
+| BCLK | D10 / P3 | I2S bit clock (firmware constant `PIN_I2S_BCLK`). |
+| LRC | D9 / P4 | I2S word select (firmware constant `PIN_I2S_LRCLK`). |
+| DIN | D8 / P2 | I2S serial data (firmware constant `PIN_I2S_DATA`). |
+| SD | D6 / P0 or 3V3 | Tie high to enable the amp (firmware drives D6 high). |
+| OUT+/OUT- | Speaker | Observes the breakout’s differential outputs. |
+
+As long as the asset WAV files are 16-bit mono the host will stream them directly; no additional conversion is required.
+
 ## Audio Assets
 
-Drop pre-generated TTS clips into the directories under `assets/`. The host streams the first audio file it finds per folder (WAV/MP3/OGG/FLAC).
+Drop pre-generated TTS clips into the directories under `assets/`. For device streaming, use mono 16‑bit WAV files; other formats are only honoured when `--local-audio` is active on the desktop.
 
 ```
 assets/
@@ -96,7 +110,7 @@ Host ➜ Device (ASCII lines):
 - `TARGET <east> <north> <up>`
 - `END`
 - `TARE`
-- `AUDIO <label> <final_flag> <base64_chunk>` (future use)
+- `AUDIO START <sample_rate_hz> <frame_count> <label>` (followed by raw 16-bit little-endian PCM bytes over USB) and `AUDIO END`
 
 Device ➜ Host:
 
@@ -104,9 +118,10 @@ Device ➜ Host:
 - `BUCKET <label>`
 - `ORIENT <east> <north> <up>`
 - `EVENT <tared|tare_wait>`
+- `LOG audio_*` (diagnostics during playback)
 
 ## Next Steps
 
-1. Implement MAX98357A audio playback on the wearable to consume the streamed `AUDIO` chunks.
-2. Characterise real-world pointing behaviour and iterate on the micro-adjustment cadence/thresholds.
+1. Characterise real-world pointing behaviour and iterate on the micro-adjustment cadence/thresholds.
+2. Verify end-to-end audio under load (long-form clips, repeated sessions) and tune buffer sizes if glitches appear.
 3. Layer logging/visualisation tooling on the host for session analysis (optional).
