@@ -15,9 +15,10 @@
 constexpr uint32_t SERIAL_BAUD = 921600;
 constexpr uint32_t GUIDANCE_INTERVAL_DEFAULT_MS = 1500;
 constexpr float ORIENTATION_SMOOTH_ALPHA = 0.2f;
-constexpr float MOTION_START_THRESHOLD_DEG = 0.4f;
+constexpr float MOTION_START_THRESHOLD_DEG = 1.0f;
 constexpr float MOTION_CONTINUE_THRESHOLD_DEG = 0.15f;
 constexpr uint32_t MOTION_IDLE_TIMEOUT_MS = 7000;
+constexpr uint32_t MOTION_START_DELAY_MS = 3000;
 constexpr bool ALLOW_DIAGONAL_BUCKETS = false;
 constexpr float MAG_DECLINATION_DEG = -8.28f;  // Update for install location.
 constexpr float MIN_DIAGONAL_DEG = 12.0f;
@@ -77,6 +78,8 @@ uint32_t lastMotionMs = 0;
 uint32_t lastGuidanceMs = 0;
 uint32_t stillnessStartMs = 0;
 uint32_t guidanceIntervalMs = GUIDANCE_INTERVAL_DEFAULT_MS;
+bool motionStartPending = false;
+uint32_t motionStartQueuedMs = 0;
 bool audioEnabled = false;
 char currentPlanet[16] = "unknown";
 Mat3 R_align = MAT3_IDENTITY;
@@ -356,6 +359,8 @@ void transitionToIdle() {
   lastGuidanceMs = 0;
   stillnessStartMs = 0;
   microCycleIndex = 0;
+  motionStartPending = false;
+  motionStartQueuedMs = 0;
   setMode(MODE_IDLE);
 }
 
@@ -417,10 +422,22 @@ void handleMotion(const EulerAngles &angles, uint32_t nowMs) {
     stillnessStartMs = nowMs;
   }
 
-  if (deviceMode == MODE_IDLE && motionScore >= MOTION_START_THRESHOLD_DEG) {
-    setMode(MODE_WAITING_FOR_START_ACK);
-    lastMotionMs = nowMs;
-    stillnessStartMs = 0;
+  if (deviceMode == MODE_IDLE) {
+    if (!motionStartPending && motionScore >= MOTION_START_THRESHOLD_DEG) {
+      // Give the wearer time to don the device before signaling the host.
+      motionStartPending = true;
+      motionStartQueuedMs = nowMs;
+    }
+    if (motionStartPending && (nowMs - motionStartQueuedMs) >= MOTION_START_DELAY_MS) {
+      setMode(MODE_WAITING_FOR_START_ACK);
+      motionStartPending = false;
+      motionStartQueuedMs = 0;
+      lastMotionMs = nowMs;
+      stillnessStartMs = 0;
+    }
+  } else {
+    motionStartPending = false;
+    motionStartQueuedMs = 0;
   }
 
   lastAngles = angles;

@@ -34,10 +34,10 @@ Requires Python 3.10+ available to `uv`.
 ### Running
 
 ```bash
-python -m pc_app.cli --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-level INFO
+python -m pc_app.cli --audio --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-level INFO
 ```
 
-- Omit `--audio` for the terminal-only pass (default). Add `--audio` once the firmware can render streamed audio.
+- Omit `--audio` for the terminal-only pass (default).
 - Combine `--audio` with `--local-audio` to play prompts on the host (WAV files only; installs `simpleaudio` via `requirements.txt`).
 - Leave auto-tare enabled (default) when the device starts docked; pass `--no-auto-tare` if you need to handle the tare manually.
 - Adjust `--cadence` to change the prompt interval (seconds).

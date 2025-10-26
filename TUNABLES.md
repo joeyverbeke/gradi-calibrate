@@ -13,6 +13,7 @@
 - `GUIDANCE_INTERVAL_DEFAULT_MS`: Default bucket cadence (milliseconds) used until the host overrides it.
 - `ORIENTATION_SMOOTH_ALPHA`: Low-pass filter coefficient for the forward vector.
 - `MOTION_START_THRESHOLD_DEG`: Minimum instantaneous angular change that triggers motion-start detection.
+- `MOTION_START_DELAY_MS`: Delay (milliseconds) inserted between motion detection and the motion start notification to the host.
 - `MOTION_CONTINUE_THRESHOLD_DEG`: Lower threshold that keeps the device in the active state once motion is detected.
 - `MOTION_IDLE_TIMEOUT_MS`: Duration of continuous stillness (below the continue threshold) before returning to Idle.
 - `MAG_DECLINATION_DEG`: Site-specific declination applied to the BNO085 yaw reading to reference true north.
