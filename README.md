@@ -6,7 +6,7 @@ Arm-worn, never-ending pointing guidance that keeps the participant aligning to 
 
 - `pc_app/`: Desktop companion package (`cli.py`, `session.py`, `planets.py`, `buckets.py`, `audio.py`).
 - `gradi_calibration/gradi_calibration.ino`: Wearable firmware for the RP2040 + BNO08x.
-- `assets/`: Bucket-specific audio placeholders (`up`, `down`, `left`, `right`, `up_right`, `up_left`, `down_right`, `down_left`, plus `intro`, `outro`).
+- `assets/`: Bucket-specific audio placeholders (`up`, `down`, `left`, `right`, `up_right`, `up_left`, `down_right`, `down_left`, plus `intro`, `outro`) with `english/` and `korean/` subfolders.
 - `TUNABLES.md`: Summary of the adjustable constants shared between host and firmware.
 
 ## Desktop App
@@ -41,6 +41,7 @@ python -m pc_app.cli --audio --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --
 - Combine `--audio` with `--local-audio` to play prompts on the host (WAV files only; installs `simpleaudio` via `requirements.txt`).
 - Leave auto-tare enabled (default) when the device starts docked; pass `--no-auto-tare` if you need to handle the tare manually.
 - Adjust `--cadence` to change the prompt interval (seconds).
+- Select the spoken language with `--language en` or `--language kr` (defaults to English). If a localized prompt is missing the app falls back to English automatically.
 - If you want a different default serial port or cadence, edit `pc_app/constants.py` or use environment-specific CLI overrides.
 
 While running, the CLI prints bucket names reported by the device and streams matching assets when audio mode is enabled. The loop is intended to run indefinitely; press `Ctrl+C` to stop.
@@ -83,18 +84,24 @@ As long as the asset WAV files are 16-bit mono the host will stream them directl
 
 ## Audio Assets
 
-Drop pre-generated TTS clips into the directories under `assets/`. For device streaming, use mono 16‑bit WAV files; other formats are only honoured when `--local-audio` is active on the desktop.
+Every prompt lives under `assets/<category>/<language>/` where `<language>` is `english` (`_EN` suffix) or `korean` (`_KR` suffix). Example:
 
 ```
 assets/
   intro/
-  outro/
+    english/Intro-Mars_EN.wav
+    korean/Intro-Mars_KR.wav
   up/
-  down/
-  ...
+    english/Up-1_EN.wav
+    korean/Up-1_KR.wav
+  outro/
+    english/Outro_EN.wav
+    korean/Outro_KR.wav
 ```
 
-Keep filenames consistent across prompts to maintain predictable playback ordering.
+- The `pc_app` streamer requires mono, 16-bit PCM WAV files. Use `tools/mp3_to_wav.py assets/` to batch-convert any MP3 placeholders; pass `--remove-source` if you no longer want to keep the MP3 copies.
+- Keep the `_EN` / `_KR` suffixes when adding new clips so the host can resolve the right language variant.
+- Local playback (`--local-audio`) shares the same files, so once converted to WAV you can stream to the wearable or play them on the host with no further changes.
 
 ## Configuration & Tuning
 

@@ -6,7 +6,7 @@ import argparse
 import logging
 
 from .audio import AudioPlayer
-from .constants import GUIDANCE_INTERVAL_SEC
+from .constants import AUDIO_LANGUAGE_CHOICES, AUDIO_LANGUAGE_DEFAULT, GUIDANCE_INTERVAL_SEC
 from .link import DeviceLink
 from .planets import ObserverLocation
 from .session import SessionController
@@ -34,6 +34,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Play bucket audio on the desktop (requires --audio); nothing is streamed to the wearable.",
     )
+    parser.add_argument(
+        "--language",
+        default=AUDIO_LANGUAGE_DEFAULT,
+        choices=AUDIO_LANGUAGE_CHOICES,
+        help="Spoken language for prompts (choices: %(choices)s).",
+    )
     return parser
 
 
@@ -52,7 +58,12 @@ def run_app() -> None:
     port = args.port
     link = DeviceLink(port=port) if port else DeviceLink()
     location = ObserverLocation(latitude_deg=args.lat, longitude_deg=args.lon)
-    audio = AudioPlayer(link=link, enabled=args.audio, local_only=args.local_audio)
+    audio = AudioPlayer(
+        link=link,
+        enabled=args.audio,
+        local_only=args.local_audio,
+        language=args.language,
+    )
     controller = SessionController(
         link=link,
         audio=audio,

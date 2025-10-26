@@ -11,6 +11,18 @@ IDLE_CHECK_INTERVAL_SEC: float = 0.2
 # Directory that contains the intro/outro and bucket audio assets.
 ASSETS_BASE_PATH: Path = Path("assets")
 
+# Spoken language defaults for audio assets.
+AUDIO_LANGUAGE_DEFAULT: str = "en"
+AUDIO_LANGUAGE_CHOICES: tuple[str, ...] = ("en", "kr")
+AUDIO_LANGUAGE_DIR_MAP: dict[str, str] = {
+    "en": "english",
+    "kr": "korean",
+}
+AUDIO_LANGUAGE_SUFFIX_MAP: dict[str, str] = {
+    "en": "_EN",
+    "kr": "_KR",
+}
+
 # Ship with terminal-only mode enabled; flip to True once audio is validated.
 AUDIO_ENABLED_DEFAULT: bool = False
 
