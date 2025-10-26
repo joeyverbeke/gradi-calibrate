@@ -34,7 +34,7 @@ Requires Python 3.10+ available to `uv`.
 ### Running
 
 ```bash
-python -m pc_app.cli --audio --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-level INFO
+python -m pc_app.cli --audio --language kr --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-level INFO
 ```
 
 - Omit `--audio` for the terminal-only pass (default).
