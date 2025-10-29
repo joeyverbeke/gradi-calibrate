@@ -80,7 +80,7 @@ Adjust the thresholds and cadence defaults in the sketch to tune responsiveness 
 | SD | D6 / P0 or 3V3 | Tie high to enable the amp (firmware drives D6 high). |
 | OUT+/OUT- | Speaker | Observes the breakout’s differential outputs. |
 
-As long as the asset WAV files are 16-bit mono the host will stream them directly; no additional conversion is required.
+As long as the asset WAV files are 16-bit mono the host will stream them directly; the wearable path now expects 48 kHz sources, so resample clips with `python tools/wav_resample.py assets --apply` after any edits.
 
 ## Audio Assets
 
@@ -99,7 +99,7 @@ assets/
     korean/Outro_KR.wav
 ```
 
-- The `pc_app` streamer requires mono, 16-bit PCM WAV files. Use `tools/mp3_to_wav.py assets/` to batch-convert any MP3 placeholders; pass `--remove-source` if you no longer want to keep the MP3 copies.
+- The `pc_app` streamer requires mono, 16-bit PCM WAV files. Use `tools/mp3_to_wav.py assets/` to batch-convert any MP3 placeholders; pass `--remove-source` if you no longer want to keep the MP3 copies. Follow up with `tools/wav_resample.py` to pin everything to 48 kHz for the RP2040 pipeline.
 - Keep the `_EN` / `_KR` suffixes when adding new clips so the host can resolve the right language variant.
 - Local playback (`--local-audio`) shares the same files, so once converted to WAV you can stream to the wearable or play them on the host with no further changes.
 

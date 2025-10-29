@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from pathlib import Path
 from typing import Optional
+import sys
 
 from .constants import (
     ASSETS_BASE_PATH,
@@ -16,7 +18,7 @@ from .link import DeviceLink
 
 logger = logging.getLogger(__name__)
 
-STREAM_FRAMES_PER_CHUNK = 256
+STREAM_FRAMES_PER_CHUNK = 960  # ~20 ms at 48 kHz
 _AUDIO_EXTENSIONS = (".wav", ".mp3", ".ogg", ".flac")
 
 
@@ -46,6 +48,7 @@ class AudioPlayer:
         enabled: bool = False,
         local_only: bool = False,
         language: str = AUDIO_LANGUAGE_DEFAULT,
+        gain: float = 1.0,
     ) -> None:
         self._link = link
         self._assets_root = assets_root
@@ -59,6 +62,7 @@ class AudioPlayer:
         for code in (self._language, AUDIO_LANGUAGE_DEFAULT):
             if code not in self._language_chain:
                 self._language_chain.append(code)
+        self._gain = float(gain)
         if enabled:
             if self._local_only:
                 logger.info(
@@ -90,6 +94,13 @@ class AudioPlayer:
     @property
     def language(self) -> str:
         return self._language
+
+    @property
+    def gain(self) -> float:
+        return self._gain
+
+    def set_gain(self, gain: float) -> None:
+        self._gain = float(gain)
 
     def play_intro(self, planet: str) -> None:
         if not self._enabled:
@@ -182,6 +193,8 @@ class AudioPlayer:
                         if valid_len == 0:
                             continue
                         chunk = chunk[:valid_len]
+                    if self._gain != 1.0:
+                        chunk = self._scale_chunk(chunk)
                     self._link.stream_audio_payload(chunk)
         except FileNotFoundError:
             logger.error("Audio file %s not found.", path.name)
@@ -248,3 +261,25 @@ class AudioPlayer:
             context,
             self._language,
         )
+
+    def _scale_chunk(self, chunk: bytes) -> bytes:
+        samples = array("h")
+        samples.frombytes(chunk)
+        if samples.itemsize != 2:
+            return chunk
+        if sys.byteorder == "big":
+            samples.byteswap()
+        gain = self._gain
+        for idx, sample in enumerate(samples):
+            if gain == 0.0:
+                scaled = 0
+            else:
+                scaled = int(sample * gain)
+            if scaled < -32768:
+                scaled = -32768
+            elif scaled > 32767:
+                scaled = 32767
+            samples[idx] = scaled
+        if sys.byteorder == "big":
+            samples.byteswap()
+        return samples.tobytes()

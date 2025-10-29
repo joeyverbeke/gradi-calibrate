@@ -40,6 +40,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=AUDIO_LANGUAGE_CHOICES,
         help="Spoken language for prompts (choices: %(choices)s).",
     )
+    parser.add_argument(
+        "--audio-gain",
+        type=float,
+        default=0.5,
+        help="Scaling factor applied to streamed audio samples (default 0.5 ≈ -6 dB).",
+    )
     return parser
 
 
@@ -63,6 +69,7 @@ def run_app() -> None:
         enabled=args.audio,
         local_only=args.local_audio,
         language=args.language,
+        gain=args.audio_gain,
     )
     controller = SessionController(
         link=link,

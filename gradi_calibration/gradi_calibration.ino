@@ -30,11 +30,52 @@ constexpr int PIN_I2S_BCLK = 3;      // D10 / P3 -> MAX98357A BCLK
 constexpr int PIN_I2S_LRCLK = 4;     // D9  / P4 -> MAX98357A LRC
 constexpr int PIN_I2S_DATA = 2;      // D8  / P2 -> MAX98357A DIN
 constexpr int PIN_AMP_ENABLE = 6;    // D6  / P0 -> MAX98357A SD (active high)
-constexpr size_t AUDIO_BUFFER_SAMPLES = 256;
+constexpr size_t AUDIO_BUFFER_SAMPLES = 1024;
 constexpr uint8_t AUDIO_SAMPLE_BITS = 16;
 constexpr uint8_t AUDIO_BYTES_PER_SAMPLE = AUDIO_SAMPLE_BITS / 8;
+constexpr size_t AUDIO_DMA_BUFFERS = 8;
+constexpr size_t AUDIO_DMA_WORDS = 256;
+
+static_assert(
+    PIN_I2S_LRCLK == PIN_I2S_BCLK + 1,
+    "RP2040 I2S requires LRCLK to be placed on BCLK+1.");
 
 static I2S i2s(OUTPUT);
+
+enum EqFilterType {
+  EQ_TYPE_HIGHPASS,
+  EQ_TYPE_PEAKING,
+  EQ_TYPE_LOWPASS
+};
+
+struct EqStageConfig {
+  EqFilterType type;
+  float freqHz;
+  float gainDb;
+  float q;
+};
+
+struct BiquadFilter {
+  float b0;
+  float b1;
+  float b2;
+  float a1;
+  float a2;
+  float z1;
+  float z2;
+  bool active;
+};
+
+constexpr size_t EQ_FILTER_COUNT = 4;
+
+const EqStageConfig EQ_STAGE_CONFIGS[EQ_FILTER_COUNT] = {
+    {EQ_TYPE_HIGHPASS, 250.0f, 0.0f, 0.707f},
+    {EQ_TYPE_PEAKING, 1000.0f, -3.0f, 1.0f},
+    {EQ_TYPE_PEAKING, 5000.0f, -2.0f, 1.2f},
+    {EQ_TYPE_LOWPASS, 7000.0f, 0.0f, 0.707f},
+};
+
+BiquadFilter eqFilters[EQ_FILTER_COUNT];
 
 struct Vector3 {
   float east;
@@ -97,6 +138,7 @@ size_t audioBufferFill = 0;
 int16_t audioBuffer[AUDIO_BUFFER_SAMPLES];
 bool audioOutputConfigured = false;
 uint32_t audioCurrentSampleRateHz = 0;
+volatile uint32_t audioUnderflowCount = 0;
 
 float clampf(float value, float minVal, float maxVal) {
   if (value < minVal) return minVal;
@@ -200,6 +242,97 @@ Mat3 rotationBetween(const Vector3 &from, const Vector3 &to) {
   return axisAngleMatrix(axis, angle);
 }
 
+void resetEqFilters() {
+  for (size_t i = 0; i < EQ_FILTER_COUNT; ++i) {
+    eqFilters[i].z1 = 0.0f;
+    eqFilters[i].z2 = 0.0f;
+  }
+}
+
+void configureBiquad(BiquadFilter *filter, EqFilterType type, float freqHz, float gainDb, float q, float sampleRate) {
+  if (!filter || sampleRate <= 0.0f || freqHz <= 0.0f || freqHz >= sampleRate * 0.48f) {
+    if (filter) {
+      filter->active = false;
+      filter->b0 = 1.0f;
+      filter->b1 = 0.0f;
+      filter->b2 = 0.0f;
+      filter->a1 = 0.0f;
+      filter->a2 = 0.0f;
+      filter->z1 = 0.0f;
+      filter->z2 = 0.0f;
+    }
+    return;
+  }
+
+  float omega = 2.0f * PI * (freqHz / sampleRate);
+  float sinOmega = sinf(omega);
+  float cosOmega = cosf(omega);
+  float alpha = sinOmega / (2.0f * q);
+
+  float b0 = 1.0f;
+  float b1 = 0.0f;
+  float b2 = 0.0f;
+  float a0 = 1.0f;
+  float a1 = 0.0f;
+  float a2 = 0.0f;
+
+  if (type == EQ_TYPE_HIGHPASS) {
+    b0 = (1.0f + cosOmega) * 0.5f;
+    b1 = -(1.0f + cosOmega);
+    b2 = (1.0f + cosOmega) * 0.5f;
+    a0 = 1.0f + alpha;
+    a1 = -2.0f * cosOmega;
+    a2 = 1.0f - alpha;
+  } else if (type == EQ_TYPE_LOWPASS) {
+    b0 = (1.0f - cosOmega) * 0.5f;
+    b1 = 1.0f - cosOmega;
+    b2 = (1.0f - cosOmega) * 0.5f;
+    a0 = 1.0f + alpha;
+    a1 = -2.0f * cosOmega;
+    a2 = 1.0f - alpha;
+  } else if (type == EQ_TYPE_PEAKING) {
+    float A = powf(10.0f, gainDb / 40.0f);
+    b0 = 1.0f + alpha * A;
+    b1 = -2.0f * cosOmega;
+    b2 = 1.0f - alpha * A;
+    a0 = 1.0f + alpha / A;
+    a1 = -2.0f * cosOmega;
+    a2 = 1.0f - alpha / A;
+  }
+
+  filter->b0 = b0 / a0;
+  filter->b1 = b1 / a0;
+  filter->b2 = b2 / a0;
+  filter->a1 = a1 / a0;
+  filter->a2 = a2 / a0;
+  filter->z1 = 0.0f;
+  filter->z2 = 0.0f;
+  filter->active = true;
+}
+
+void configureEqFilters(uint32_t sampleRate) {
+  float sampleRateF = static_cast<float>(sampleRate);
+  for (size_t i = 0; i < EQ_FILTER_COUNT; ++i) {
+    const EqStageConfig &cfg = EQ_STAGE_CONFIGS[i];
+    configureBiquad(&eqFilters[i], cfg.type, cfg.freqHz, cfg.gainDb, cfg.q, sampleRateF);
+  }
+}
+
+float processEqSample(float input) {
+  float x = input;
+  for (size_t i = 0; i < EQ_FILTER_COUNT; ++i) {
+    BiquadFilter &stage = eqFilters[i];
+    if (!stage.active) {
+      continue;
+    }
+    float y = stage.b0 * x + stage.z1;
+    stage.z1 = stage.b1 * x + stage.z2 - stage.a1 * y;
+    stage.z2 = stage.b2 * x - stage.a2 * y;
+    x = y;
+  }
+  return x;
+}
+
 bool configureAudioOutput(uint32_t sampleRate) {
   if (sampleRate == 0) {
     return false;
@@ -218,6 +351,8 @@ bool configureAudioOutput(uint32_t sampleRate) {
   i2s.setBCLK(PIN_I2S_BCLK);
   i2s.setDATA(PIN_I2S_DATA);
   i2s.setBitsPerSample(AUDIO_SAMPLE_BITS);
+  i2s.setBuffers(AUDIO_DMA_BUFFERS, AUDIO_DMA_WORDS);
+  i2s.setSysClk(static_cast<int>(sampleRate));
 
   if (!i2s.begin(static_cast<long>(sampleRate))) {
     Serial.println(F("LOG audio_i2s_begin_failed"));
@@ -233,6 +368,7 @@ void resetAudioStreamState() {
   audioStreamMode = AUDIO_STREAM_IDLE;
   audioSamplesRemaining = 0;
   audioBufferFill = 0;
+  audioUnderflowCount = 0;
 }
 
 void flushAudioBuffer() {
@@ -243,12 +379,27 @@ void flushAudioBuffer() {
     audioBufferFill = 0;
     return;
   }
-  for (size_t i = 0; i < audioBufferFill; ++i) {
-    int16_t s = audioBuffer[i];
-    while (!i2s.write16(s, s)) {
-      delayMicroseconds(50);
-    }
+
+  static int16_t stereoScratch[AUDIO_BUFFER_SAMPLES * 2];
+  for (size_t i = 0, j = 0; i < audioBufferFill; ++i) {
+    const int16_t sample = audioBuffer[i];
+    stereoScratch[j++] = sample;
+    stereoScratch[j++] = sample;
   }
+
+  const uint8_t *payload = reinterpret_cast<const uint8_t *>(stereoScratch);
+  const size_t totalBytes = audioBufferFill * sizeof(int16_t) * 2;
+  size_t written = 0;
+  while (written < totalBytes) {
+    size_t chunk = i2s.write(payload + written, totalBytes - written);
+    if (chunk == 0) {
+      ++audioUnderflowCount;
+      delayMicroseconds(50);
+      continue;
+    }
+    written += chunk;
+  }
+
   audioBufferFill = 0;
 }
 
@@ -295,6 +446,7 @@ void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const cha
   audioSamplesRemaining = frameCount;
   audioStreamMode = AUDIO_STREAM_RECEIVING;
   audioBufferFill = 0;
+  audioUnderflowCount = 0;
   if (shouldPlay) {
     Serial.print(F("LOG audio_start "));
     if (label && *label) {
@@ -310,6 +462,8 @@ void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const cha
 void handleAudioEndCommand() {
   flushAudioBuffer();
   Serial.println(F("LOG audio_end"));
+  Serial.print(F("LOG audio_stats underruns="));
+  Serial.println(audioUnderflowCount);
   resetAudioStreamState();
 }
 
@@ -637,6 +791,7 @@ void pollSerial() {
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
+  Serial.ignoreFlowControl(true);
   unsigned long start = millis();
   while (!Serial && (millis() - start) < 500) {
     delay(10);
