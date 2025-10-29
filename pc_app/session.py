@@ -93,7 +93,7 @@ class SessionController:
                 time.sleep(0.05)
         except KeyboardInterrupt:
             logger.info("Session loop interrupted by user.")
-            self._send_idle_safe()
+            self._shutdown(abort=True)
         finally:
             self._link.close()
 
@@ -122,12 +122,14 @@ class SessionController:
         if not self._state.active:
             return
         logger.info("Session ended; returning to idle.")
+        self._audio.stop_streaming()
         self._link.send_session_end()
         self._audio.play_outro()
         self._state = SessionState(cadence_sec=self._state.cadence_sec)
         self._last_orientation = None
         self._last_bucket_eval = None
         self._last_bucket_output = None
+        self._pending_tare = self._auto_tare
 
     def _tick(self) -> None:
         if not self._state.active or self._state.target_vector is None:
@@ -234,10 +236,32 @@ class SessionController:
                         "Bucket mismatch (device=%s local=%s | yaw=%.2f pitch=%.2f)",
                         bucket_label_raw,
                         expected,
-                        decision.yaw_error_deg,
-                        decision.pitch_error_deg,
+                        decision.yaw_error_deg if decision else 0.0,
+                        decision.pitch_error_deg if decision else 0.0,
                     )
                 self._last_bucket_output = None
+
+    def _abort_session(self) -> None:
+        if not self._state.active:
+            return
+        logger.info("Aborting active session.")
+        self._audio.stop_streaming()
+        try:
+            self._link.send_session_end()
+        except Exception as exc:
+            logger.debug("Failed to send session end during abort: %s", exc)
+        self._state = SessionState(cadence_sec=self._state.cadence_sec)
+        self._last_orientation = None
+        self._last_bucket_eval = None
+        self._last_bucket_output = None
+        self._pending_tare = self._auto_tare
+
+    def _shutdown(self, abort: bool = False) -> None:
+        if abort:
+            self._abort_session()
+        else:
+            self._end_session()
+        self._send_idle_safe()
 
     def _format_bucket_debug(self, bucket_label: str) -> str:
         target_vec = self._state.target_vector

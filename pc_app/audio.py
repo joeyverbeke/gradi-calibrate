@@ -102,6 +102,15 @@ class AudioPlayer:
     def set_gain(self, gain: float) -> None:
         self._gain = float(gain)
 
+    def stop_streaming(self) -> None:
+        """Ensure any in-flight device stream is finalized."""
+        if not self.should_stream:
+            return
+        try:
+            self._link.finish_audio_stream()
+        except Exception as exc:  # pragma: no cover - serial/hardware dependent
+            logger.debug("Failed to finalize device audio stream: %s", exc)
+
     def play_intro(self, planet: str) -> None:
         if not self._enabled:
             logger.info("Intro (planet=%s) suppressed in terminal-only mode.", planet)

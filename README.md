@@ -102,6 +102,7 @@ assets/
 - The `pc_app` streamer requires mono, 16-bit PCM WAV files. Use `tools/mp3_to_wav.py assets/` to batch-convert any MP3 placeholders; pass `--remove-source` if you no longer want to keep the MP3 copies. Follow up with `tools/wav_resample.py` to pin everything to 48 kHz for the RP2040 pipeline.
 - Keep the `_EN` / `_KR` suffixes when adding new clips so the host can resolve the right language variant.
 - Local playback (`--local-audio`) shares the same files, so once converted to WAV you can stream to the wearable or play them on the host with no further changes.
+- Runtime gain is exposed via `--audio-gain` (default 0.5 ≈ -6 dB). Increase toward `1.0` if you need more level, or lower it to tame harsh clips before they reach the MAX98357A.
 
 ## Configuration & Tuning
 
