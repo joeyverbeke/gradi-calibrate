@@ -43,7 +43,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-gain",
         type=float,
-        default=0.5,
+        #default=0.5,
+        default=1.0,
         help="Scaling factor applied to streamed audio samples (default 0.5 ≈ -6 dB).",
     )
     return parser

@@ -34,7 +34,7 @@ Requires Python 3.10+ available to `uv`.
 ### Running
 
 ```bash
-python -m pc_app.cli --audio --language kr --port /dev/ttyACM0 --lat 35.1458 --lon 126.9231 --log-level INFO
+python -m pc_app.cli --audio --language kr --lat 35.1458 --lon 126.9231 --log-level INFO
 ```
 
 - Omit `--audio` for the terminal-only pass (default).
@@ -42,7 +42,7 @@ python -m pc_app.cli --audio --language kr --port /dev/ttyACM0 --lat 35.1458 --l
 - Leave auto-tare enabled (default) when the device starts docked; pass `--no-auto-tare` if you need to handle the tare manually.
 - Adjust `--cadence` to change the prompt interval (seconds).
 - Select the spoken language with `--language en` or `--language kr` (defaults to English). If a localized prompt is missing the app falls back to English automatically.
-- If you want a different default serial port or cadence, edit `pc_app/constants.py` or use environment-specific CLI overrides.
+- The host defaults to `/dev/gradi-rp-calibrate`, so only pass `--port` when you need an override; edit `pc_app/constants.py` if you want to change the baked-in defaults.
 
 While running, the CLI prints bucket names reported by the device and streams matching assets when audio mode is enabled. The loop is intended to run indefinitely; press `Ctrl+C` to stop.
 

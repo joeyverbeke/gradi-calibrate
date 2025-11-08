@@ -43,7 +43,7 @@ ALLOW_DIAGONAL_BUCKETS: bool = False
 
 # Serial transport configuration.
 USB_BAUD_RATE: int = 921600
-SERIAL_PORT_DEFAULT = "/dev/ttyACM0"
+SERIAL_PORT_DEFAULT = "/dev/gradi-rp-calibrate"
 SERIAL_TIMEOUT_SEC: float = 0.1
 
 # How frequently to resend target vectors to defend against dropped packets.
