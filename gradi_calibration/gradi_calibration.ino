@@ -23,7 +23,10 @@ constexpr bool ALLOW_DIAGONAL_BUCKETS = false;
 constexpr float MAG_DECLINATION_DEG = -8.28f;  // Update for install location.
 constexpr float MIN_DIAGONAL_DEG = 12.0f;
 constexpr float MICRO_ADJUST_DEG = 1.0f;
-constexpr float DOCK_ALIGNMENT_THRESHOLD_DEG = 8.0f;
+constexpr float DOCK_ALIGNMENT_THRESHOLD_DEG = 18.0f;
+constexpr uint32_t DOCK_ALIGNMENT_DWELL_MS = 2500;
+constexpr float DOCK_EXIT_THRESHOLD_DEG = 12.0f;
+constexpr uint32_t DOCK_EXIT_MIN_MS = 500;
 constexpr float NEAR_TARGET_ANGLE_DEG = 5.0f;
 
 constexpr int PIN_I2S_BCLK = 3;      // D10 / P3 -> MAX98357A BCLK
@@ -125,6 +128,9 @@ bool audioEnabled = false;
 char currentPlanet[16] = "unknown";
 Mat3 R_align = MAT3_IDENTITY;
 size_t microCycleIndex = 0;
+bool hasLeftDock = false;
+uint32_t dockExitStartMs = 0;
+uint32_t dockAlignStartMs = 0;
 
 enum AudioStreamMode {
   AUDIO_STREAM_IDLE,
@@ -515,6 +521,9 @@ void transitionToIdle() {
   microCycleIndex = 0;
   motionStartPending = false;
   motionStartQueuedMs = 0;
+  hasLeftDock = false;
+  dockExitStartMs = 0;
+  dockAlignStartMs = 0;
   setMode(MODE_IDLE);
 }
 
@@ -654,6 +663,38 @@ void guidanceTick(uint32_t nowMs) {
   sendOrientation(smoothedOrientation, currentAngles);
   const char *bucket = selectBucket(smoothedOrientation, targetVector);
   sendBucket(bucket);
+}
+
+void updateDockTracking(uint32_t nowMs) {
+  if (!hasOrientation) {
+    dockExitStartMs = 0;
+    dockAlignStartMs = 0;
+    return;
+  }
+
+  float dockAngle = angleBetween(smoothedOrientation, DOCK_FORWARD_WORLD);
+  bool beyondExit = dockAngle >= DOCK_EXIT_THRESHOLD_DEG;
+  bool inDockCone = dockAngle <= DOCK_ALIGNMENT_THRESHOLD_DEG;
+
+  if (!hasLeftDock) {
+    if (beyondExit) {
+      if (dockExitStartMs == 0) {
+        dockExitStartMs = nowMs;
+      } else if ((nowMs - dockExitStartMs) >= DOCK_EXIT_MIN_MS) {
+        hasLeftDock = true;
+      }
+    } else {
+      dockExitStartMs = 0;
+    }
+  }
+
+  if (inDockCone) {
+    if (dockAlignStartMs == 0) {
+      dockAlignStartMs = nowMs;
+    }
+  } else {
+    dockAlignStartMs = 0;
+  }
 }
 
 void handleSerialLine(char *line) {
@@ -827,19 +868,23 @@ void loop() {
   Vector3 orientationVec;
   if (readOrientation(&angles, &orientationVec)) {
     handleMotion(angles, now);
+    updateDockTracking(now);
   }
 
   if (deviceMode != MODE_IDLE) {
     if (stillnessStartMs != 0 && (now - stillnessStartMs) >= MOTION_IDLE_TIMEOUT_MS) {
-      bool docked = angleBetween(smoothedOrientation, DOCK_FORWARD_WORLD) <= DOCK_ALIGNMENT_THRESHOLD_DEG;
+      float dockAngle = angleBetween(smoothedOrientation, DOCK_FORWARD_WORLD);
+      bool inDockCone = dockAngle <= DOCK_ALIGNMENT_THRESHOLD_DEG;
+      bool dockDwellMet =
+          inDockCone && dockAlignStartMs != 0 && (now - dockAlignStartMs) >= DOCK_ALIGNMENT_DWELL_MS;
       bool nearTarget =
           targetValid && angleBetween(smoothedOrientation, targetVector) <= NEAR_TARGET_ANGLE_DEG;
-      if (docked || !targetValid) {
+      if (dockDwellMet && hasLeftDock) {
         transitionToIdle();
       } else if (nearTarget) {
         stillnessStartMs = now;
       } else {
-        // Wearer is still hunting; keep guiding instead of dropping to idle.
+        // Wearer is still hunting or has not returned to the dock; keep guiding instead of dropping to idle.
         stillnessStartMs = now;
       }
     }

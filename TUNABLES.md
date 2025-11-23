@@ -22,5 +22,8 @@
 - `MIN_DIAGONAL_DEG`: Minimum simultaneous yaw and pitch error (degrees) before diagonal prompts are selected.
 - `MICRO_ADJUST_DEG`: Error magnitude threshold that triggers the micro-adjustment bucket cycle instead of declaring the user “centered.”
 - `ALLOW_DIAGONAL_BUCKETS`: Mirror of the host flag; when false the firmware emits only cardinal prompts.
-- `DOCK_ALIGNMENT_THRESHOLD_DEG`: Angular tolerance (degrees) used to recognise the dock pose when deciding to return to Idle.
+- `DOCK_ALIGNMENT_THRESHOLD_DEG`: Angular tolerance (degrees) used to recognise the dock pose when deciding to return to Idle; paired with a dwell to avoid spurious endings.
+- `DOCK_ALIGNMENT_DWELL_MS`: How long the device must remain within the dock cone before transitioning to Idle.
+- `DOCK_EXIT_THRESHOLD_DEG`: Angular separation from the dock pose required before the device is treated as “removed from the dock” for the next end-of-session detection.
+- `DOCK_EXIT_MIN_MS`: Minimum time outside the dock cone before marking that the device has left the dock.
 - `NEAR_TARGET_ANGLE_DEG`: Angular error (degrees) treated as “micro adjustments,” preventing an Idle transition while the wearer hovers near the target.
