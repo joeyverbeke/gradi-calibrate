@@ -44,8 +44,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--audio-gain",
         type=float,
         #default=0.5,
-        default=1.0,
-        help="Scaling factor applied to streamed audio samples (default 0.5 ≈ -6 dB).",
+        default=2.5,
+        help="Scaling factor applied to streamed audio samples (default 2.5).",
     )
     return parser
 
