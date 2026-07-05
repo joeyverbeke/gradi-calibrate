@@ -29,6 +29,32 @@ constexpr float DOCK_EXIT_THRESHOLD_DEG = 12.0f;
 constexpr uint32_t DOCK_EXIT_MIN_MS = 500;
 constexpr float NEAR_TARGET_ANGLE_DEG = 5.0f;
 
+// --- Accel-based "returned to holder" detection (Change 2) ---
+// Primary discriminator is rigid stillness on the accelerometer channel: a docked
+// device is mechanically grounded (very low accel-magnitude sigma) while an
+// unsupported held arm always exhibits tremor/sway (higher sigma). Pose match and
+// placement-transition arming are supporting evidence. Yaw/magnetometer is NOT used.
+constexpr bool USE_ACCEL_DOCK_DETECT = true;       // false = legacy dock-cone path (instant reflash rollback)
+constexpr bool USE_TRANSITION_ARMING = true;       // require a recent put-down/motion before arming idle
+// PLACEHOLDER — MUST be measured in situ with the installation audio playing; do not
+// treat as final. Set between racked-device noise floor and quietest held-arm value
+// only if they separate >=3x (see TUNABLES.md / the LOG dock calibration step).
+constexpr float DOCK_RIGID_SIGMA = 0.04f;          // m/s^2 accel-magnitude sigma ceiling for "rigid"
+                                                   // BENCH-PROVISIONAL: geo-mean of home floor (~0.0195)
+                                                   // and held-still (~0.058) measurements, no show audio.
+                                                   // RE-MEASURE in situ with the subwoofer playing before the show.
+constexpr uint32_t DOCK_RIGID_WINDOW_MS = 1500;    // rolling window for the accel-sigma estimate
+constexpr uint32_t DOCK_RVC_HZ = 100;              // nominal BNO08x RVC sample rate (for window sizing)
+constexpr float DOCK_POSE_TOL_DEG = 10.0f;         // pitch/roll match tolerance vs. captured holder pose
+constexpr uint32_t DOCK_CONFIRM_MS = 2000;         // sustain time with all terms true before idling
+constexpr uint32_t DOCK_ARM_WINDOW_MS = 5000;      // look-back: idle only arms if a placement event was this recent
+constexpr float DOCK_ARM_ACCEL_DELTA = 1.5f;       // m/s^2 per-sample excursion that counts as a placement event
+constexpr float DOCK_ARM_ANGLE_DELTA_DEG = 20.0f;  // per-sample forward-vector change that counts as a placement event
+// UNVERIFIED fallbacks — replace with the measured holder pitch/roll (open question #3).
+// Only used before the first TARE; the runtime dockPitch/dockRoll auto-capture at tare.
+constexpr float DOCK_PITCH_FALLBACK_DEG = 0.0f;
+constexpr float DOCK_ROLL_FALLBACK_DEG = 0.0f;
+
 constexpr int PIN_I2S_BCLK = 3;      // D10 / P3 -> MAX98357A BCLK
 constexpr int PIN_I2S_LRCLK = 4;     // D9  / P4 -> MAX98357A LRC
 constexpr int PIN_I2S_DATA = 2;      // D8  / P2 -> MAX98357A DIN
@@ -131,6 +157,27 @@ size_t microCycleIndex = 0;
 bool hasLeftDock = false;
 uint32_t dockExitStartMs = 0;
 uint32_t dockAlignStartMs = 0;
+
+// Accel-based dock detection state (Change 2).
+float dockPitch = DOCK_PITCH_FALLBACK_DEG;   // captured from live pitch at TARE (device docked then)
+float dockRoll = DOCK_ROLL_FALLBACK_DEG;     // captured from live roll at TARE
+float accelMag = 0.0f;                        // latest |accel| (m/s^2), gravity included
+bool hasAccel = false;
+constexpr size_t DOCK_ACCEL_WINDOW = (DOCK_RIGID_WINDOW_MS * DOCK_RVC_HZ) / 1000;  // ~150 samples
+float accelWindow[DOCK_ACCEL_WINDOW] = {0.0f};
+size_t accelWindowCount = 0;
+size_t accelWindowHead = 0;
+double accelSum = 0.0;
+double accelSumSq = 0.0;
+float accelSigma = 0.0f;
+bool accelSigmaValid = false;                 // true only once the window is full (~1.5 s)
+float prevAccelMag = 0.0f;
+bool hasPrevAccel = false;
+Vector3 prevForwardForArm = {0.0f, 0.0f, 1.0f};
+bool hasPrevForwardForArm = false;
+uint32_t lastPlacementEventMs = 0;            // last gross-motion/put-down excursion
+uint32_t dockConfirmStartMs = 0;              // start of the current sustained-docked window
+uint32_t lastDockLogMs = 0;                   // throttle for the LOG dock diagnostic
 
 enum AudioStreamMode {
   AUDIO_STREAM_IDLE,
@@ -524,6 +571,7 @@ void transitionToIdle() {
   hasLeftDock = false;
   dockExitStartMs = 0;
   dockAlignStartMs = 0;
+  dockConfirmStartMs = 0;
   setMode(MODE_IDLE);
 }
 
@@ -539,6 +587,12 @@ bool readOrientation(EulerAngles *anglesOut, Vector3 *forwardOut) {
   if (!rvc.read(&data)) {
     return false;
   }
+  // COMPILE-TIME CHECK (open question #6): the Adafruit BNO08x_RVC library was not
+  // installed on the authoring machine, so these field names are unverified there.
+  // If the build errors, adjust these three reads to the library's accel field names.
+  accelMag = sqrtf(data.x_accel * data.x_accel + data.y_accel * data.y_accel +
+                   data.z_accel * data.z_accel);
+  hasAccel = true;
   EulerAngles angles = {data.yaw, data.pitch, data.roll};
   Vector3 forward = eulerToForward(angles);
   Vector3 corrected = matMulVec(R_align, forward);
@@ -697,6 +751,58 @@ void updateDockTracking(uint32_t nowMs) {
   }
 }
 
+// Accel-based rigid-stillness detector + placement-transition arming (Change 2).
+// Runs once per RVC sample. Maintains a rolling accel-magnitude window (O(1) update)
+// and flags a placement event on any per-sample accel or forward-vector excursion.
+void updateAccelDetect(const Vector3 &forwardVec, uint32_t nowMs) {
+  if (!hasAccel) {
+    return;
+  }
+  float mag = accelMag;
+
+  // Rolling window sum / sum-of-squares (subtract the evicted sample when full).
+  if (accelWindowCount == DOCK_ACCEL_WINDOW) {
+    float old = accelWindow[accelWindowHead];
+    accelSum -= old;
+    accelSumSq -= (double)old * old;
+  } else {
+    accelWindowCount++;
+  }
+  accelWindow[accelWindowHead] = mag;
+  accelSum += mag;
+  accelSumSq += (double)mag * mag;
+  accelWindowHead = (accelWindowHead + 1) % DOCK_ACCEL_WINDOW;
+
+  if (accelWindowCount == DOCK_ACCEL_WINDOW) {
+    double mean = accelSum / (double)accelWindowCount;
+    double var = accelSumSq / (double)accelWindowCount - mean * mean;
+    if (var < 0.0) {
+      var = 0.0;  // guard tiny negatives from float round-off
+    }
+    accelSigma = (float)sqrt(var);
+    accelSigmaValid = true;
+  } else {
+    accelSigmaValid = false;  // require a full ~1.5 s window before trusting sigma
+  }
+
+  // Placement-transition arming: any gross motion / put-down bump refreshes the arm.
+  bool placement = false;
+  if (hasPrevAccel && fabsf(mag - prevAccelMag) > DOCK_ARM_ACCEL_DELTA) {
+    placement = true;
+  }
+  if (hasPrevForwardForArm &&
+      angleBetween(forwardVec, prevForwardForArm) > DOCK_ARM_ANGLE_DELTA_DEG) {
+    placement = true;
+  }
+  if (placement) {
+    lastPlacementEventMs = nowMs;
+  }
+  prevAccelMag = mag;
+  hasPrevAccel = true;
+  prevForwardForArm = forwardVec;
+  hasPrevForwardForArm = true;
+}
+
 void handleSerialLine(char *line) {
   if (strncmp(line, "START", 5) == 0) {
     audioEnabled = false;
@@ -761,6 +867,10 @@ void handleSerialLine(char *line) {
       smoothedOrientation = normalize(corrected);
       hasOrientation = true;
       microCycleIndex = 0;
+      // Device is physically docked at tare: capture the holder's gravity-referenced
+      // pitch/roll for the drift-free pose-match term (Change 2).
+      dockPitch = currentAngles.pitch;
+      dockRoll = currentAngles.roll;
       Serial.println(F("EVENT tared"));
     } else {
       Serial.println(F("EVENT tare_wait"));
@@ -869,23 +979,70 @@ void loop() {
   if (readOrientation(&angles, &orientationVec)) {
     handleMotion(angles, now);
     updateDockTracking(now);
+    updateAccelDetect(orientationVec, now);
   }
 
   if (deviceMode != MODE_IDLE) {
-    if (stillnessStartMs != 0 && (now - stillnessStartMs) >= MOTION_IDLE_TIMEOUT_MS) {
-      float dockAngle = angleBetween(smoothedOrientation, DOCK_FORWARD_WORLD);
-      bool inDockCone = dockAngle <= DOCK_ALIGNMENT_THRESHOLD_DEG;
-      bool dockDwellMet =
-          inDockCone && dockAlignStartMs != 0 && (now - dockAlignStartMs) >= DOCK_ALIGNMENT_DWELL_MS;
-      bool nearTarget =
-          targetValid && angleBetween(smoothedOrientation, targetVector) <= NEAR_TARGET_ANGLE_DEG;
-      if (dockDwellMet && hasLeftDock) {
-        transitionToIdle();
-      } else if (nearTarget) {
-        stillnessStartMs = now;
+    if (USE_ACCEL_DOCK_DETECT) {
+      // Rigid-stillness is the primary discriminator; pose match and arming are
+      // supporting evidence. nearTarget is intentionally NOT consulted: a genuinely
+      // docked device must idle even when the holder pose coincides with the target.
+      bool poseMatch =
+          hasAngles &&
+          fabsf(angularDifference(currentAngles.pitch, dockPitch)) < DOCK_POSE_TOL_DEG &&
+          fabsf(angularDifference(currentAngles.roll, dockRoll)) < DOCK_POSE_TOL_DEG;
+      bool rigidStill = accelSigmaValid && accelSigma < DOCK_RIGID_SIGMA;
+      bool armed = !USE_TRANSITION_ARMING ||
+                   (lastPlacementEventMs != 0 && (now - lastPlacementEventMs) <= DOCK_ARM_WINDOW_MS);
+      bool docked = hasLeftDock && poseMatch && rigidStill && armed;
+      if (docked) {
+        if (dockConfirmStartMs == 0) {
+          dockConfirmStartMs = now;
+        } else if ((now - dockConfirmStartMs) >= DOCK_CONFIRM_MS) {
+          transitionToIdle();
+        }
       } else {
-        // Wearer is still hunting or has not returned to the dock; keep guiding instead of dropping to idle.
-        stillnessStartMs = now;
+        dockConfirmStartMs = 0;
+      }
+
+      // Throttled (~1 Hz) diagnostic so the artist can see exactly which term blocks
+      // or falsely passes during a live show. Skip if we just idled this cycle.
+      if (deviceMode != MODE_IDLE && (now - lastDockLogMs) >= 1000) {
+        lastDockLogMs = now;
+        uint32_t confirmMs = (dockConfirmStartMs != 0) ? (now - dockConfirmStartMs) : 0;
+        Serial.print(F("LOG dock pitch="));
+        Serial.print(currentAngles.pitch, 1);
+        Serial.print(F(" roll="));
+        Serial.print(currentAngles.roll, 1);
+        Serial.print(F(" accsig="));
+        Serial.print(accelSigmaValid ? accelSigma : -1.0f, 3);
+        Serial.print(F(" armed="));
+        Serial.print(armed ? 1 : 0);
+        Serial.print(F(" pose="));
+        Serial.print(poseMatch ? 1 : 0);
+        Serial.print(F(" rigid="));
+        Serial.print(rigidStill ? 1 : 0);
+        Serial.print(F(" confirm_ms="));
+        Serial.println(confirmMs);
+      }
+    } else {
+      // Legacy yaw-referenced dock-cone path, unchanged — kept for instant reflash
+      // rollback via USE_ACCEL_DOCK_DETECT = false.
+      if (stillnessStartMs != 0 && (now - stillnessStartMs) >= MOTION_IDLE_TIMEOUT_MS) {
+        float dockAngle = angleBetween(smoothedOrientation, DOCK_FORWARD_WORLD);
+        bool inDockCone = dockAngle <= DOCK_ALIGNMENT_THRESHOLD_DEG;
+        bool dockDwellMet =
+            inDockCone && dockAlignStartMs != 0 && (now - dockAlignStartMs) >= DOCK_ALIGNMENT_DWELL_MS;
+        bool nearTarget =
+            targetValid && angleBetween(smoothedOrientation, targetVector) <= NEAR_TARGET_ANGLE_DEG;
+        if (dockDwellMet && hasLeftDock) {
+          transitionToIdle();
+        } else if (nearTarget) {
+          stillnessStartMs = now;
+        } else {
+          // Wearer is still hunting or has not returned to the dock; keep guiding instead of dropping to idle.
+          stillnessStartMs = now;
+        }
       }
     }
   }
