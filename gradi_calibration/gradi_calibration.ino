@@ -30,12 +30,18 @@ constexpr uint32_t DOCK_EXIT_MIN_MS = 500;
 constexpr float NEAR_TARGET_ANGLE_DEG = 5.0f;
 
 // --- Accel-based "returned to holder" detection (Change 2) ---
-// Primary discriminator is rigid stillness on the accelerometer channel: a docked
+// Sole discriminator is rigid stillness on the accelerometer channel: a docked
 // device is mechanically grounded (very low accel-magnitude sigma) while an
-// unsupported held arm always exhibits tremor/sway (higher sigma). Pose match and
-// placement-transition arming are supporting evidence. Yaw/magnetometer is NOT used.
+// unsupported held arm always exhibits tremor/sway (higher sigma). Pose match
+// (gravity-referenced pitch/roll) narrows the window; yaw/magnetometer is NOT used.
+// Decision: hasLeftDock && poseMatch && rigidStill, sustained for DOCK_CONFIRM_MS.
+// NOTE: a per-sample "placement-transition arming" gate was tried and removed — a
+// gentle, deliberate set-down (e.g. lowering the device into hanging holder arms)
+// produces no sharp jolt, so the arming detector missed real placements and blocked
+// legitimate docking. It also gave zero protection against the held-still collision
+// (rigid stillness carries that). The collision defense rests entirely on the sigma
+// separation, verified in situ (see TUNABLES.md / the LOG dock calibration step).
 constexpr bool USE_ACCEL_DOCK_DETECT = true;       // false = legacy dock-cone path (instant reflash rollback)
-constexpr bool USE_TRANSITION_ARMING = true;       // require a recent put-down/motion before arming idle
 // PLACEHOLDER — MUST be measured in situ with the installation audio playing; do not
 // treat as final. Set between racked-device noise floor and quietest held-arm value
 // only if they separate >=3x (see TUNABLES.md / the LOG dock calibration step).
@@ -47,9 +53,13 @@ constexpr uint32_t DOCK_RIGID_WINDOW_MS = 1500;    // rolling window for the acc
 constexpr uint32_t DOCK_RVC_HZ = 100;              // nominal BNO08x RVC sample rate (for window sizing)
 constexpr float DOCK_POSE_TOL_DEG = 10.0f;         // pitch/roll match tolerance vs. captured holder pose
 constexpr uint32_t DOCK_CONFIRM_MS = 2000;         // sustain time with all terms true before idling
-constexpr uint32_t DOCK_ARM_WINDOW_MS = 5000;      // look-back: idle only arms if a placement event was this recent
-constexpr float DOCK_ARM_ACCEL_DELTA = 1.5f;       // m/s^2 per-sample excursion that counts as a placement event
-constexpr float DOCK_ARM_ANGLE_DELTA_DEG = 20.0f;  // per-sample forward-vector change that counts as a placement event
+// Accel-magnitude sanity band (m/s^2): samples outside this are treated as corrupt
+// RVC/UART frames and dropped before entering the sigma window, so a single garbage
+// reading can't inflate sigma and spuriously break "rigid" for a full window. Gravity
+// is ~9.8; gentle handling stays well inside. A real 22 g-ish glitch (seen in testing)
+// or a dropout-to-zero falls outside and is rejected.
+constexpr float DOCK_ACCEL_MIN_MS2 = 2.0f;
+constexpr float DOCK_ACCEL_MAX_MS2 = 30.0f;
 // UNVERIFIED fallbacks — replace with the measured holder pitch/roll (open question #3).
 // Only used before the first TARE; the runtime dockPitch/dockRoll auto-capture at tare.
 constexpr float DOCK_PITCH_FALLBACK_DEG = 0.0f;
@@ -173,11 +183,6 @@ double accelSum = 0.0;
 double accelSumSq = 0.0;
 float accelSigma = 0.0f;
 bool accelSigmaValid = false;                 // true only once the window is full (~1.5 s)
-float prevAccelMag = 0.0f;
-bool hasPrevAccel = false;
-Vector3 prevForwardForArm = {0.0f, 0.0f, 1.0f};
-bool hasPrevForwardForArm = false;
-uint32_t lastPlacementEventMs = 0;            // last gross-motion/put-down excursion
 uint32_t dockConfirmStartMs = 0;              // start of the current sustained-docked window
 uint32_t lastDockLogMs = 0;                   // throttle for the LOG dock diagnostic
 
@@ -709,17 +714,32 @@ void handleMotion(const EulerAngles &angles, uint32_t nowMs) {
   }
 
   if (deviceMode == MODE_IDLE) {
-    if (!motionStartPending && motionScore >= MOTION_START_THRESHOLD_DEG) {
-      // Give the wearer time to don the device before signaling the host.
-      motionStartPending = true;
-      motionStartQueuedMs = nowMs;
-    }
-    if (motionStartPending && (nowMs - motionStartQueuedMs) >= MOTION_START_DELAY_MS) {
-      setMode(MODE_WAITING_FOR_START_ACK);
+    // Motion-start keys on the fused orientation delta, which is jittered by vibration
+    // (the device's own outro playing right after docking, or a room subwoofer coupling
+    // into a compliant holder) — that can false-start a phantom session while the device
+    // sits docked, and because it never left the dock it can't self-recover. Two guards,
+    // both required for a real hands-on don:
+    //  - accel magnitude is rotation-invariant and immune to that vibration, so require
+    //    genuine accel motion (NOT rigid) — a real don always spikes accel well past this.
+    //  - never arm while the device's own speaker is playing.
+    bool rigid = accelSigmaValid && accelSigma < DOCK_RIGID_SIGMA;
+    bool audioPlaying = (audioStreamMode != AUDIO_STREAM_IDLE);
+    if (rigid || audioPlaying) {
       motionStartPending = false;
       motionStartQueuedMs = 0;
-      lastMotionMs = nowMs;
-      stillnessStartMs = 0;
+    } else {
+      if (!motionStartPending && motionScore >= MOTION_START_THRESHOLD_DEG) {
+        // Give the wearer time to don the device before signaling the host.
+        motionStartPending = true;
+        motionStartQueuedMs = nowMs;
+      }
+      if (motionStartPending && (nowMs - motionStartQueuedMs) >= MOTION_START_DELAY_MS) {
+        setMode(MODE_WAITING_FOR_START_ACK);
+        motionStartPending = false;
+        motionStartQueuedMs = 0;
+        lastMotionMs = nowMs;
+        stillnessStartMs = 0;
+      }
     }
   } else {
     motionStartPending = false;
@@ -820,14 +840,18 @@ void updateDockTracking(uint32_t nowMs) {
   }
 }
 
-// Accel-based rigid-stillness detector + placement-transition arming (Change 2).
-// Runs once per RVC sample. Maintains a rolling accel-magnitude window (O(1) update)
-// and flags a placement event on any per-sample accel or forward-vector excursion.
-void updateAccelDetect(const Vector3 &forwardVec, uint32_t nowMs) {
+// Accel-based rigid-stillness detector (Change 2). Runs once per RVC sample and
+// maintains a rolling accel-magnitude window (O(1) update) whose sigma is the "rigid"
+// discriminator. Corrupt samples outside the gravity-plausible band are dropped so a
+// single garbage RVC/UART frame can't inflate sigma and break "rigid" for a window.
+void updateAccelDetect() {
   if (!hasAccel) {
     return;
   }
   float mag = accelMag;
+  if (mag < DOCK_ACCEL_MIN_MS2 || mag > DOCK_ACCEL_MAX_MS2) {
+    return;  // implausible magnitude → corrupt frame; leave the window untouched
+  }
 
   // Rolling window sum / sum-of-squares (subtract the evicted sample when full).
   if (accelWindowCount == DOCK_ACCEL_WINDOW) {
@@ -853,23 +877,6 @@ void updateAccelDetect(const Vector3 &forwardVec, uint32_t nowMs) {
   } else {
     accelSigmaValid = false;  // require a full ~1.5 s window before trusting sigma
   }
-
-  // Placement-transition arming: any gross motion / put-down bump refreshes the arm.
-  bool placement = false;
-  if (hasPrevAccel && fabsf(mag - prevAccelMag) > DOCK_ARM_ACCEL_DELTA) {
-    placement = true;
-  }
-  if (hasPrevForwardForArm &&
-      angleBetween(forwardVec, prevForwardForArm) > DOCK_ARM_ANGLE_DELTA_DEG) {
-    placement = true;
-  }
-  if (placement) {
-    lastPlacementEventMs = nowMs;
-  }
-  prevAccelMag = mag;
-  hasPrevAccel = true;
-  prevForwardForArm = forwardVec;
-  hasPrevForwardForArm = true;
 }
 
 void handleSerialLine(char *line) {
@@ -1067,24 +1074,24 @@ void loop() {
   EulerAngles angles;
   Vector3 orientationVec;
   if (readOrientation(&angles, &orientationVec)) {
+    updateAccelDetect();          // refresh accel sigma first; handleMotion reads it
     handleMotion(angles, now);
     updateDockTracking(now);
-    updateAccelDetect(orientationVec, now);
   }
 
   if (deviceMode != MODE_IDLE) {
     if (USE_ACCEL_DOCK_DETECT) {
-      // Rigid-stillness is the primary discriminator; pose match and arming are
-      // supporting evidence. nearTarget is intentionally NOT consulted: a genuinely
-      // docked device must idle even when the holder pose coincides with the target.
+      // Rigid-stillness (accel sigma) is the sole discriminator; pose match narrows the
+      // window. nearTarget is intentionally NOT consulted: a genuinely docked device must
+      // idle even when the holder pose coincides with the target. Deterministic: once the
+      // device is picked up (hasLeftDock), then held mechanically still at the dock pose
+      // for DOCK_CONFIRM_MS, it idles — no dependence on how the placement was performed.
       bool poseMatch =
           hasAngles &&
           fabsf(angularDifference(currentAngles.pitch, dockPitch)) < DOCK_POSE_TOL_DEG &&
           fabsf(angularDifference(currentAngles.roll, dockRoll)) < DOCK_POSE_TOL_DEG;
       bool rigidStill = accelSigmaValid && accelSigma < DOCK_RIGID_SIGMA;
-      bool armed = !USE_TRANSITION_ARMING ||
-                   (lastPlacementEventMs != 0 && (now - lastPlacementEventMs) <= DOCK_ARM_WINDOW_MS);
-      bool docked = hasLeftDock && poseMatch && rigidStill && armed;
+      bool docked = hasLeftDock && poseMatch && rigidStill;
       if (docked) {
         if (dockConfirmStartMs == 0) {
           dockConfirmStartMs = now;
@@ -1092,7 +1099,7 @@ void loop() {
           transitionToIdle();
         }
       } else {
-        dockConfirmStartMs = 0;
+        dockConfirmStartMs = 0;  // a term dropped; restart the sustain window
       }
 
       // Throttled (~1 Hz) diagnostic so the artist can see exactly which term blocks
@@ -1106,8 +1113,6 @@ void loop() {
         Serial.print(currentAngles.roll, 1);
         Serial.print(F(" accsig="));
         Serial.print(accelSigmaValid ? accelSigma : -1.0f, 3);
-        Serial.print(F(" armed="));
-        Serial.print(armed ? 1 : 0);
         Serial.print(F(" pose="));
         Serial.print(poseMatch ? 1 : 0);
         Serial.print(F(" rigid="));

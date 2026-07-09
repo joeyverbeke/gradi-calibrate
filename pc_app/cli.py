@@ -20,8 +20,8 @@ from .session import SessionController
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Gradi Calibration desktop driver")
     parser.add_argument("--port", default=None, help="Serial port connected to the wearable (default: auto)")
-    parser.add_argument("--lat", type=float, default=37.7749, help="Observer latitude in degrees")
-    parser.add_argument("--lon", type=float, default=-122.4194, help="Observer longitude in degrees (east positive)")
+    parser.add_argument("--lat", type=float, default=34.0407, help="Observer latitude in degrees")
+    parser.add_argument("--lon", type=float, default=-118.2688, help="Observer longitude in degrees (east positive)")
     parser.add_argument(
         "--audio",
         action="store_true",
