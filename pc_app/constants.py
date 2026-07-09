@@ -1,6 +1,12 @@
 """Shared constants and configuration flags for the desktop app."""
 
+import logging
 from pathlib import Path
+
+# Custom log level for audio streaming diagnostics, below DEBUG so normal DEBUG runs
+# stay free of the per-clip audio telemetry. Select with --log-level DEBUG-AUDIO.
+DEBUG_AUDIO_LEVEL: int = 5
+logging.addLevelName(DEBUG_AUDIO_LEVEL, "DEBUG-AUDIO")
 
 # Prompt cadence in seconds while guidance is active.
 GUIDANCE_INTERVAL_SEC: float = 1.5

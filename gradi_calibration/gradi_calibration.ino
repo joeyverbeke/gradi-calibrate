@@ -59,10 +59,12 @@ constexpr int PIN_I2S_BCLK = 3;      // D10 / P3 -> MAX98357A BCLK
 constexpr int PIN_I2S_LRCLK = 4;     // D9  / P4 -> MAX98357A LRC
 constexpr int PIN_I2S_DATA = 2;      // D8  / P2 -> MAX98357A DIN
 constexpr int PIN_AMP_ENABLE = 6;    // D6  / P0 -> MAX98357A SD (active high)
-constexpr size_t AUDIO_BUFFER_SAMPLES = 1024;
+constexpr size_t AUDIO_RING_SAMPLES      = 36864;  // mono samples, ~768 ms @ 48 kHz, 72 KB RAM
+constexpr size_t AUDIO_PREBUFFER_SAMPLES = 19200;  // ~400 ms: gate before I2S output starts
+constexpr size_t AUDIO_I2S_CHUNK_FRAMES  = 256;    // = AUDIO_DMA_WORDS; per-pass write granularity
 constexpr uint8_t AUDIO_SAMPLE_BITS = 16;
 constexpr uint8_t AUDIO_BYTES_PER_SAMPLE = AUDIO_SAMPLE_BITS / 8;
-constexpr size_t AUDIO_DMA_BUFFERS = 8;
+constexpr size_t AUDIO_DMA_BUFFERS = 16;           // ~85 ms DMA-level cushion (rides loop stalls)
 constexpr size_t AUDIO_DMA_WORDS = 256;
 
 static_assert(
@@ -182,16 +184,26 @@ uint32_t lastDockLogMs = 0;                   // throttle for the LOG dock diagn
 enum AudioStreamMode {
   AUDIO_STREAM_IDLE,
   AUDIO_STREAM_RECEIVING,
-  AUDIO_STREAM_WAITING_END
+  AUDIO_STREAM_DRAINING
 };
 
 AudioStreamMode audioStreamMode = AUDIO_STREAM_IDLE;
 uint32_t audioSamplesRemaining = 0;
-size_t audioBufferFill = 0;
-int16_t audioBuffer[AUDIO_BUFFER_SAMPLES];
+// Producer (USB) and consumer (I2S) both run in loop(); no ISR touches the ring,
+// so plain size_t state is safe without volatile / critical sections.
+int16_t  audioRing[AUDIO_RING_SAMPLES];
+size_t   audioRingHead = 0;                 // next write index (from USB)
+size_t   audioRingTail = 0;                 // next read index (to I2S)
+size_t   audioRingCount = 0;                // samples currently buffered
+bool     audioPlaybackStarted = false;
+uint32_t audioTrueUnderflows = 0;           // true I2S starvation events (getUnderflow)
+size_t   audioCushionMin = SIZE_MAX;        // low-water of ring + DMA fill after start (frames)
+size_t   audioDmaCapacityBytes = 0;         // availableForWrite() baseline captured after begin()
+uint32_t audioStartMs = 0;                  // millis() when first payload byte of a clip arrived
+bool     audioStartMsSet = false;
+uint32_t audioPrebufMs = 0;                 // wall time from first byte to prebuffer gate open
 bool audioOutputConfigured = false;
 uint32_t audioCurrentSampleRateHz = 0;
-volatile uint32_t audioUnderflowCount = 0;
 
 float clampf(float value, float minVal, float maxVal) {
   if (value < minVal) return minVal;
@@ -405,7 +417,8 @@ bool configureAudioOutput(uint32_t sampleRate) {
   i2s.setDATA(PIN_I2S_DATA);
   i2s.setBitsPerSample(AUDIO_SAMPLE_BITS);
   i2s.setBuffers(AUDIO_DMA_BUFFERS, AUDIO_DMA_WORDS);
-  i2s.setSysClk(static_cast<int>(sampleRate));
+  // NB: i2s.setSysClk() is called once in setup() before the UARTs start, not here,
+  // to avoid re-parenting the system clock mid-session (see proposal §5.3).
 
   if (!i2s.begin(static_cast<long>(sampleRate))) {
     Serial.println(F("LOG audio_i2s_begin_failed"));
@@ -414,78 +427,120 @@ bool configureAudioOutput(uint32_t sampleRate) {
 
   audioOutputConfigured = true;
   audioCurrentSampleRateHz = sampleRate;
+  audioDmaCapacityBytes = (size_t)i2s.availableForWrite();  // empty-DMA baseline (F-1)
   return true;
 }
 
 void resetAudioStreamState() {
   audioStreamMode = AUDIO_STREAM_IDLE;
   audioSamplesRemaining = 0;
-  audioBufferFill = 0;
-  audioUnderflowCount = 0;
+  audioRingHead = 0;
+  audioRingTail = 0;
+  audioRingCount = 0;
+  audioPlaybackStarted = false;
+  audioTrueUnderflows = 0;
+  audioCushionMin = SIZE_MAX;
+  audioStartMs = 0;
+  audioStartMsSet = false;
+  audioPrebufMs = 0;
 }
 
-void flushAudioBuffer() {
-  if (audioBufferFill == 0) {
-    return;
-  }
-  if (!audioOutputConfigured) {
-    audioBufferFill = 0;
-    return;
-  }
-
-  static int16_t stereoScratch[AUDIO_BUFFER_SAMPLES * 2];
-  for (size_t i = 0, j = 0; i < audioBufferFill; ++i) {
-    const int16_t sample = audioBuffer[i];
-    stereoScratch[j++] = sample;
-    stereoScratch[j++] = sample;
-  }
-
-  const uint8_t *payload = reinterpret_cast<const uint8_t *>(stereoScratch);
-  const size_t totalBytes = audioBufferFill * sizeof(int16_t) * 2;
-  size_t written = 0;
-  while (written < totalBytes) {
-    size_t chunk = i2s.write(payload + written, totalBytes - written);
-    if (chunk == 0) {
-      ++audioUnderflowCount;
-      delayMicroseconds(50);
-      continue;
-    }
-    written += chunk;
-  }
-
-  audioBufferFill = 0;
-}
-
-bool pumpAudioStream() {
+// Receive half: drain USB PCM bytes into the ring. When the ring is full we simply
+// stop reading, so TinyUSB NAKs the host (natural flow control, no data loss). Returns
+// true if any samples were consumed. When output is not configured (skip case) the
+// bytes are discarded rather than buffered, so the ring stays empty and drains cleanly.
+bool pumpAudioReceive() {
   if (audioStreamMode != AUDIO_STREAM_RECEIVING) {
     return false;
   }
 
   bool consumed = false;
-  while (audioSamplesRemaining > 0 && Serial.available() >= AUDIO_BYTES_PER_SAMPLE) {
+  while (audioSamplesRemaining > 0 &&
+         audioRingCount < AUDIO_RING_SAMPLES &&
+         Serial.available() >= AUDIO_BYTES_PER_SAMPLE) {
     int first = Serial.read();
     int second = Serial.read();
     if (first < 0 || second < 0) {
       break;
     }
-    int16_t sample = static_cast<int16_t>(first | (second << 8));
-    audioBuffer[audioBufferFill++] = sample;
+    if (!audioStartMsSet) {   // F-5: mark arrival of the clip's first payload byte
+      audioStartMs = millis();
+      audioStartMsSet = true;
+    }
+    if (audioOutputConfigured) {
+      audioRing[audioRingHead] = static_cast<int16_t>(first | (second << 8));
+      audioRingHead = (audioRingHead + 1) % AUDIO_RING_SAMPLES;
+      audioRingCount++;
+    }
     audioSamplesRemaining--;
     consumed = true;
-    if (audioBufferFill >= AUDIO_BUFFER_SAMPLES) {
-      flushAudioBuffer();
-    }
-  }
-
-  if (audioSamplesRemaining == 0 && audioStreamMode == AUDIO_STREAM_RECEIVING) {
-    flushAudioBuffer();
-    audioStreamMode = AUDIO_STREAM_WAITING_END;
   }
 
   return consumed;
 }
 
+// Playback half: feed I2S strictly non-blocking via availableForWrite(). Gated by a
+// prebuffer so output only starts once the ring holds a comfortable cushion (or the
+// whole clip, for very short clips). Counts true starvation via getUnderflow().
+void pumpAudioPlayback() {
+  if (!audioOutputConfigured) return;
+
+  if (!audioPlaybackStarted) {
+    bool enough = audioRingCount >= AUDIO_PREBUFFER_SAMPLES;
+    bool clipComplete = (audioSamplesRemaining == 0);   // short clip fully received
+    if (!enough && !clipComplete) return;
+    audioPlaybackStarted = true;
+    audioPrebufMs = audioStartMsSet ? (millis() - audioStartMs) : 0;   // F-5 throughput probe
+    (void)i2s.getUnderflow();   // clear the flag: DMA was playing silence pre-start
+  }
+
+  static int16_t stereoScratch[AUDIO_I2S_CHUNK_FRAMES * 2];
+  while (audioRingCount > 0) {
+    size_t framesFree = (size_t)i2s.availableForWrite() / 4;  // bytes -> stereo frames
+    if (framesFree == 0) break;
+    size_t frames = min(min(framesFree, audioRingCount), AUDIO_I2S_CHUNK_FRAMES);
+    for (size_t i = 0, j = 0; i < frames; ++i) {
+      int16_t s = audioRing[audioRingTail];
+      audioRingTail = (audioRingTail + 1) % AUDIO_RING_SAMPLES;
+      stereoScratch[j++] = s;
+      stereoScratch[j++] = s;
+    }
+    audioRingCount -= frames;
+    i2s.write((const uint8_t *)stereoScratch, frames * 4);
+    // availableForWrite() >= frames*4 was checked, so this cannot come up short.
+  }
+
+  if (audioPlaybackStarted) {
+    if (i2s.getUnderflow()) audioTrueUnderflows++;               // TRUE starvation events
+    // Real cushion = ring + queued DMA (F-4). Skip the natural end-of-clip drain so it
+    // doesn't drag the low-water mark to 0 once the clip is fully consumed.
+    if (audioSamplesRemaining > 0 || audioRingCount > 0) {
+      size_t dmaFillFrames = (audioDmaCapacityBytes - (size_t)i2s.availableForWrite()) / 4;
+      size_t cushionFrames = audioRingCount + dmaFillFrames;
+      if (cushionFrames < audioCushionMin) audioCushionMin = cushionFrames;
+    }
+  }
+}
+
+// Called from loop() once the ring has fully drained while DRAINING.
+void finishAudioDrain() {
+  Serial.println(F("LOG audio_end"));
+  Serial.print(F("LOG audio_stats underruns="));
+  Serial.print(audioTrueUnderflows);
+  Serial.print(F(" mincushion="));
+  Serial.print(audioCushionMin == SIZE_MAX ? 0UL : (unsigned long)audioCushionMin);
+  Serial.print(F(" prebuf_ms="));
+  Serial.println((unsigned long)audioPrebufMs);
+  resetAudioStreamState();
+}
+
 void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const char *label) {
+  if (audioStreamMode == AUDIO_STREAM_DRAINING && audioRingCount > 0) {
+    // Host started the next clip before the previous tail finished draining. Dropping
+    // the tail is the correct degradation; the host end-sleep (§4.2) makes it rare.
+    Serial.print(F("LOG audio_drain_cut remaining="));
+    Serial.println((unsigned long)audioRingCount);
+  }
   resetAudioStreamState();
   if (frameCount == 0 || sampleRate == 0) {
     return;
@@ -493,13 +548,15 @@ void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const cha
 
   bool shouldPlay = audioEnabled && configureAudioOutput(sampleRate);
   if (!shouldPlay) {
+    if (audioOutputConfigured) {
+      i2s.end();
+      audioCurrentSampleRateHz = 0;
+    }
     audioOutputConfigured = false;
   }
 
   audioSamplesRemaining = frameCount;
   audioStreamMode = AUDIO_STREAM_RECEIVING;
-  audioBufferFill = 0;
-  audioUnderflowCount = 0;
   if (shouldPlay) {
     Serial.print(F("LOG audio_start "));
     if (label && *label) {
@@ -513,11 +570,23 @@ void handleAudioStartCommand(uint32_t sampleRate, uint32_t frameCount, const cha
 }
 
 void handleAudioEndCommand() {
-  flushAudioBuffer();
-  Serial.println(F("LOG audio_end"));
-  Serial.print(F("LOG audio_stats underruns="));
-  Serial.println(audioUnderflowCount);
-  resetAudioStreamState();
+  if (audioStreamMode != AUDIO_STREAM_RECEIVING) {
+    return;
+  }
+  // Pad the ring up to the next full I2S chunk so a sub-chunk tail is not stuck forever
+  // in a partial DMA buffer (§1.3 / §3.5 step 1). Only meaningful when we're buffering.
+  if (audioOutputConfigured) {
+    size_t remainder = audioRingCount % AUDIO_I2S_CHUNK_FRAMES;
+    if (remainder != 0) {
+      size_t pad = AUDIO_I2S_CHUNK_FRAMES - remainder;
+      for (size_t i = 0; i < pad && audioRingCount < AUDIO_RING_SAMPLES; ++i) {
+        audioRing[audioRingHead] = 0;
+        audioRingHead = (audioRingHead + 1) % AUDIO_RING_SAMPLES;
+        audioRingCount++;
+      }
+    }
+  }
+  audioStreamMode = AUDIO_STREAM_DRAINING;
 }
 
 void sendState(const char *state) {
@@ -910,14 +979,15 @@ void pollSerial() {
   static char buffer[160];
   static size_t index = 0;
   while (true) {
-    if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
-      bool consumed = pumpAudioStream();
-      if (!consumed) {
+    if (audioStreamMode == AUDIO_STREAM_RECEIVING && audioSamplesRemaining > 0) {
+      pumpAudioReceive();
+      if (audioSamplesRemaining > 0) {
+        // Either out of serial bytes or the ring is full; in both cases every pending
+        // inbound byte is still PCM, so don't try to parse it as a line. Break and let
+        // loop() pump playback; the host is stalled by flow control if the ring is full.
         break;
       }
-      if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
-        continue;
-      }
+      // Payload complete: remaining inbound bytes are line protocol (AUDIO END).
     }
 
     if (!Serial.available()) {
@@ -941,6 +1011,10 @@ void pollSerial() {
 }
 
 void setup() {
+  // Set the system clock for clean 48 kHz division once, before the UARTs compute their
+  // divisors, so audio never re-parents clk_peri mid-session (proposal §5.3).
+  i2s.setSysClk(48000);
+
   Serial.begin(SERIAL_BAUD);
   Serial.ignoreFlowControl(true);
   unsigned long start = millis();
@@ -968,10 +1042,26 @@ void setup() {
 
 void loop() {
   if (audioStreamMode == AUDIO_STREAM_RECEIVING) {
-    pumpAudioStream();
+    pumpAudioReceive();
   }
 
   pollSerial();
+
+  if (audioStreamMode == AUDIO_STREAM_RECEIVING || audioStreamMode == AUDIO_STREAM_DRAINING) {
+    pumpAudioPlayback();
+    if (audioStreamMode == AUDIO_STREAM_DRAINING) {
+      // Device-authoritative end (F-1): finish only when the ring is empty AND every DMA
+      // buffer has been returned (available() back to its empty baseline), so audio_end
+      // marks true playback completion, not just ring drain. The unconfigured skip path
+      // has an empty ring and no DMA, so it completes immediately (F-2).
+      bool drained = !audioOutputConfigured ||
+                     (audioRingCount == 0 &&
+                      (size_t)i2s.availableForWrite() >= audioDmaCapacityBytes);
+      if (drained) {
+        finishAudioDrain();
+      }
+    }
+  }
 
   uint32_t now = millis();
   EulerAngles angles;

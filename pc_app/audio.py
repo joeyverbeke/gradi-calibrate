@@ -18,7 +18,7 @@ from .link import DeviceLink
 
 logger = logging.getLogger(__name__)
 
-STREAM_FRAMES_PER_CHUNK = 960  # ~20 ms at 48 kHz
+STREAM_FRAMES_PER_CHUNK = 4800  # ~100 ms at 48 kHz; fewer usbipd round trips per second
 _AUDIO_EXTENSIONS = (".wav", ".mp3", ".ogg", ".flac")
 
 
@@ -107,7 +107,8 @@ class AudioPlayer:
         if not self.should_stream:
             return
         try:
-            self._link.finish_audio_stream()
+            # Teardown/safety path: never block on a device that may be wedged (H-2).
+            self._link.finish_audio_stream(wait=False)
         except Exception as exc:  # pragma: no cover - serial/hardware dependent
             logger.debug("Failed to finalize device audio stream: %s", exc)
 
@@ -156,6 +157,7 @@ class AudioPlayer:
         import wave
 
         stream_started = False
+        completed_ok = False
         try:
             with wave.open(str(path), "rb") as wav_handle:
                 num_channels = wav_handle.getnchannels()
@@ -205,6 +207,7 @@ class AudioPlayer:
                     if self._gain != 1.0:
                         chunk = self._scale_chunk(chunk)
                     self._link.stream_audio_payload(chunk)
+                completed_ok = True
         except FileNotFoundError:
             logger.error("Audio file %s not found.", path.name)
         except wave.Error as exc:
@@ -214,7 +217,9 @@ class AudioPlayer:
         finally:
             if stream_started:
                 try:
-                    self._link.finish_audio_stream()
+                    # Only wait for the device drain on a clean send; on an error/abort
+                    # tear down without blocking on the device (H-2).
+                    self._link.finish_audio_stream(wait=completed_ok)
                 except Exception as exc:  # pragma: no cover - serial/hardware dependent
                     logger.error("Failed to finalize audio stream for %s: %s", label, exc)
 

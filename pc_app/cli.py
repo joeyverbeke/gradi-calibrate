@@ -6,7 +6,12 @@ import argparse
 import logging
 
 from .audio import AudioPlayer
-from .constants import AUDIO_LANGUAGE_CHOICES, AUDIO_LANGUAGE_DEFAULT, GUIDANCE_INTERVAL_SEC
+from .constants import (
+    AUDIO_LANGUAGE_CHOICES,
+    AUDIO_LANGUAGE_DEFAULT,
+    DEBUG_AUDIO_LEVEL,
+    GUIDANCE_INTERVAL_SEC,
+)
 from .link import DeviceLink
 from .planets import ObserverLocation
 from .session import SessionController
@@ -23,7 +28,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable prompt playback; combine with --local-audio to loop audio locally instead of streaming.",
     )
     parser.add_argument("--cadence", type=float, default=GUIDANCE_INTERVAL_SEC, help="Guidance cadence in seconds")
-    parser.add_argument("--log-level", default="INFO", help="Python logging level (DEBUG, INFO, ...)")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Python logging level (DEBUG-AUDIO, DEBUG, INFO, ...); "
+        "DEBUG-AUDIO adds the audio streaming diagnostics that plain DEBUG omits.",
+    )
     parser.add_argument(
         "--no-auto-tare",
         action="store_true",
@@ -43,9 +53,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-gain",
         type=float,
-        #default=0.5,
-        default=2.5,
-        help="Scaling factor applied to streamed audio samples (default 2.5).",
+        default=1.0,
+        help="Scaling factor applied to streamed audio samples (default 1.0); "
+        "values >1.0 clip the normalized assets.",
     )
     return parser
 
@@ -57,8 +67,13 @@ def run_app() -> None:
     if args.local_audio and not args.audio:
         parser.error("--local-audio requires --audio")
 
+    level_name = args.log_level.upper().replace("_", "-")
+    if level_name == "DEBUG-AUDIO":
+        log_level = DEBUG_AUDIO_LEVEL
+    else:
+        log_level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
