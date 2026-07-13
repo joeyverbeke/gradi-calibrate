@@ -1,6 +1,14 @@
 # Gradi Calibration
 
-Arm-worn, never-ending pointing guidance that keeps the participant aligning to a randomly selected planet. The desktop Python app computes a target vector, drives session control, and (optionally) streams TTS audio. The RP2040 firmware maintains the motion state machine, quantises pointing error into eight directional buckets, and reports its status back to the host.
+Arm-worn, never-ending pointing guidance that keeps the participant aligning to a randomly selected planet. The desktop Python app computes a target vector, decides the spoken prompt with body-centric guidance, drives session control, and (optionally) streams TTS audio. The RP2040 firmware maintains the motion state machine, streams orientation, and plays audio; it still emits a `BUCKET` line each tick, but the host is authoritative for what the participant hears and uses the device label only as a timing tick / fallback.
+
+### Guidance model (host-side, `pc_app/buckets.py`)
+
+Prompts are chosen the way a human moves rather than as an abstract yaw/pitch pair:
+
+- **Azimuth error → turn the body** (left/right). When the target is far off-azimuth (e.g. behind you) guidance enters a **TURN phase** and streams a stable "right, right, right…" until you have spun to face it, with a rear-hemisphere latch so left/right never flip-flops behind you and a zenith guard so a near-overhead target goes straight to "up".
+- **Elevation error → raise/lower the arm** (up/down), measured in the world frame so up/down is unambiguous no matter which way you face.
+- **The piece never resolves.** Near the target a slow orbital *phantom-target wander* (±≈1.8°, never reaching zero) keeps the honest prompt gently circling, and the spoken cadence stretches (same volume, more space around each word) so the ending feels like an asymptote, not a mechanical cycle. Toggle with `BODY_CENTRIC_GUIDANCE` / `--no-wander`; see `TUNABLES.md`.
 
 ## Repository Layout
 
@@ -40,11 +48,11 @@ python -m pc_app.cli --audio --language kr --lat 35.1458 --lon 126.9231 --log-le
 - Omit `--audio` for the terminal-only pass (default).
 - Combine `--audio` with `--local-audio` to play prompts on the host (WAV files only; installs `simpleaudio` via `requirements.txt`).
 - Leave auto-tare enabled (default) when the device starts docked; pass `--no-auto-tare` if you need to handle the tare manually.
-- Adjust `--cadence` to change the prompt interval (seconds).
+- Adjust `--cadence` to change the baseline spoken prompt interval (seconds); it stretches automatically as you close in. Pass `--no-wander` to guide toward the exact target instead of the never-resolving phantom.
 - Select the spoken language with `--language en` or `--language kr` (defaults to English). If a localized prompt is missing the app falls back to English automatically.
 - The host defaults to `/dev/gradi-rp-calibrate`, so only pass `--port` when you need an override; edit `pc_app/constants.py` if you want to change the baked-in defaults.
 
-While running, the CLI prints bucket names reported by the device and streams matching assets when audio mode is enabled. The loop is intended to run indefinitely; press `Ctrl+C` to stop.
+While running, the CLI prints the host-chosen prompt (with a `phase=… dAz=… dEl=… err=…` debug tail) for each spoken tick and streams matching assets when audio mode is enabled. The loop is intended to run indefinitely; press `Ctrl+C` to stop.
 
 ## Firmware
 

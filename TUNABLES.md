@@ -1,13 +1,32 @@
 # Gradi Calibration Tunable Parameters
 
 ### Desktop (`pc_app/constants.py`)
-- `GUIDANCE_INTERVAL_SEC`: Default prompt cadence used when the firmware does not request a different value.
-- `TARGET_BROADCAST_INTERVAL_SEC`: How often the target vector is resent to guard against dropped serial packets.
+- `GUIDANCE_INTERVAL_SEC`: Legacy default prompt cadence. Superseded for speech by `PROMPT_INTERVAL_SEC`; retained for backward compatibility.
+- `TARGET_BROADCAST_INTERVAL_SEC`: How often the target vector is resent to guard against dropped serial packets (also the wander step rate).
 - `BUCKET_LABELS`: Canonical ordering of feedback buckets; matches asset folder names and firmware expectations.
 - `ALLOW_DIAGONAL_BUCKETS`: When false, incoming diagonal prompts are collapsed to the dominant cardinal direction.
 - `AUDIO_ENABLED_DEFAULT`: Convenience flag to launch the desktop app in terminal-only or audio-streaming mode.
 - `ASSETS_BASE_PATH`: Location of the on-disk audio assets.
 - `SERIAL_PORT_DEFAULT`, `USB_BAUD_RATE`, `SERIAL_TIMEOUT_SEC`: Serial transport configuration.
+
+> **The host is now authoritative for the spoken prompt.** The firmware still runs its own `selectBucket` and emits a `BUCKET` line each tick, but the host prefers the label computed in `pc_app/buckets.py`; the device `BUCKET` line is used only as a timing tick (and as a fallback if an `ORIENT` line is dropped, which logs a warning). `pc_app/buckets.py` and the firmware's `selectBucket` are therefore **no longer mirrors** — do not expect the firmware `MICRO_ADJUST_DEG` / `MIN_DIAGONAL_DEG` behaviour to match what the participant hears.
+
+#### Body-centric guidance (`pc_app/constants.py`, Workstream A)
+- `BODY_CENTRIC_GUIDANCE`: Master switch. `True` = the body-centric phase machine (azimuth error → turn body left/right; elevation error → raise/lower arm up/down). `False` = the legacy yaw/pitch algorithm, kept intact for host-only rollback (restart the CLI, no reflash).
+- `AZ_TURN_ENTER_DEG` / `AZ_TURN_EXIT_DEG`: Weighted-azimuth hysteresis band for entering/leaving the TURN phase (must satisfy EXIT < ENTER). In TURN the host streams only left/right until the wearer has spun to face the target.
+- `REAR_LATCH_DEG`: Beyond this `|dAz|` the sign of the turn is noise; the previously issued turn direction is held so left/right does not flip-flop behind the wearer.
+- `MIN_AZ_WEIGHT`: Floor on the azimuth weight near the zenith.
+- `AZ_WEIGHT_FADE_START_DEG`: Target elevation at which the azimuth weight starts fading from 1.0 toward `MIN_AZ_WEIGHT` at 90°. Below it, facing the target counts fully; only near straight-up does azimuth stop mattering. (Implementer note: the design doc specified `cos(el)`, but that made the az −60°/el 70° acceptance case say "up" instead of "left" while the TURN band is pinned at 20–35°; this zenith-band fade satisfies every behavioural test and the near-overhead → up goal.)
+
+#### Forever-calibration end-state (`pc_app/constants.py`, Workstream B — host-only, no volume change)
+- `WANDER_ENABLED` (CLI `--no-wander` to disable): Master switch for the phantom-target wander that keeps the piece from ever resolving.
+- `WANDER_AMPLITUDE_DEG` / `WANDER_MIN_DEG`: Max / min offset magnitude of the slow orbital drift once engaged. The min is the guaranteed unreachable floor.
+- `WANDER_PERIOD_SEC`: Orbit/drift time constant (~one slow revolution). Slow enough to chase, fast enough never to pin down.
+- `WANDER_ENGAGE_DEG`: Error above which the wander is disengaged (far-field guidance is exact); it blends in via smoothstep between here and `NEAR_ENTER_DEG`, and only after the wearer has first gotten close.
+- `DEVICE_TICK_SEC`: Cadence sent to the firmware in `START` (device tick / telemetry rate, **not** the speech rate). Default 0.5 s; fall back to 1.5 s if the faster tick ever misbehaves in situ (both are pure host config).
+- `PROMPT_INTERVAL_SEC`: Baseline seconds between spoken prompts far from the target. CLI `--cadence` maps here. The host gates speech against this; device ticks in between are consumed silently.
+- `NEAR_CADENCE_SCALE_MAX`: Interval multiplier as error → 0 (voice becomes sparse and calm near the target — same volume, more space around each word).
+- `NEAR_ENTER_DEG` / `NEAR_EXIT_DEG`: Near-mode hysteresis band for the cadence stretch.
 
 ### Firmware (`gradi_calibration/gradi_calibration.ino`)
 - `GUIDANCE_INTERVAL_DEFAULT_MS`: Default bucket cadence (milliseconds) used until the host overrides it.

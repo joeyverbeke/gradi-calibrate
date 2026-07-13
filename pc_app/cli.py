@@ -10,7 +10,7 @@ from .constants import (
     AUDIO_LANGUAGE_CHOICES,
     AUDIO_LANGUAGE_DEFAULT,
     DEBUG_AUDIO_LEVEL,
-    GUIDANCE_INTERVAL_SEC,
+    PROMPT_INTERVAL_SEC,
 )
 from .link import DeviceLink
 from .planets import ObserverLocation
@@ -27,7 +27,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable prompt playback; combine with --local-audio to loop audio locally instead of streaming.",
     )
-    parser.add_argument("--cadence", type=float, default=GUIDANCE_INTERVAL_SEC, help="Guidance cadence in seconds")
+    parser.add_argument(
+        "--cadence",
+        type=float,
+        default=PROMPT_INTERVAL_SEC,
+        help="Baseline seconds between spoken prompts far from target (stretched near it)",
+    )
+    parser.add_argument(
+        "--no-wander",
+        action="store_true",
+        help="Disable the phantom target wander; the host guides toward the exact target.",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -93,6 +103,7 @@ def run_app() -> None:
         location=location,
         cadence_sec=args.cadence,
         auto_tare=not args.no_auto_tare,
+        wander_enabled=not args.no_wander,
     )
     controller.run_forever()
 

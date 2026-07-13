@@ -11,7 +11,16 @@ from typing import Optional, Tuple
 
 from . import buckets
 from .audio import AudioPlayer
-from .constants import ALLOW_DIAGONAL_BUCKETS, GUIDANCE_INTERVAL_SEC, TARGET_BROADCAST_INTERVAL_SEC
+from .constants import (
+    ALLOW_DIAGONAL_BUCKETS,
+    DEVICE_TICK_SEC,
+    NEAR_CADENCE_SCALE_MAX,
+    NEAR_ENTER_DEG,
+    NEAR_EXIT_DEG,
+    PROMPT_INTERVAL_SEC,
+    TARGET_BROADCAST_INTERVAL_SEC,
+    WANDER_ENABLED,
+)
 from .link import DeviceLink
 from .planets import ObserverLocation, PlanetCoefficients, select_planet, target_unit_vector
 
@@ -54,9 +63,14 @@ class SessionState:
     active: bool = False
     current_planet: Optional[PlanetCoefficients] = None
     target_vector: Optional[tuple[float, float, float]] = None
+    # The (possibly wander-perturbed) target the host currently guides toward and
+    # broadcasts. Equals target_vector when the wander is disengaged/disabled.
+    guidance_target_vector: Optional[tuple[float, float, float]] = None
     last_target_broadcast: float = 0.0
     last_guidance_prompt: float = 0.0
-    cadence_sec: float = GUIDANCE_INTERVAL_SEC
+    # Baseline seconds between spoken prompts (from --cadence). The device ticks
+    # faster (DEVICE_TICK_SEC); the host gates speech against this baseline.
+    cadence_sec: float = PROMPT_INTERVAL_SEC
 
 
 class SessionController:
@@ -65,12 +79,14 @@ class SessionController:
         link: DeviceLink,
         audio: AudioPlayer,
         location: ObserverLocation,
-        cadence_sec: float = GUIDANCE_INTERVAL_SEC,
+        cadence_sec: float = PROMPT_INTERVAL_SEC,
         auto_tare: bool = True,
+        wander_enabled: bool = WANDER_ENABLED,
     ) -> None:
         self._link = link
         self._audio = audio
         self._location = location
+        self._wander_enabled = wander_enabled
         self._state = SessionState(cadence_sec=cadence_sec)
         self._last_orientation: Optional[dict] = None
         self._last_bucket_eval: Optional[buckets.BucketDecision] = None
@@ -80,6 +96,10 @@ class SessionController:
         self._pending_tare: bool = auto_tare
         self._last_tare_attempt: float = 0.0
         self._tare_retry_interval_sec: float = 1.0
+        # Body-centric guidance phase/latch state and the phantom-target wander.
+        self._guidance = buckets.GuidanceState()
+        self._wander = buckets.TargetWander()
+        self._near_mode: bool = False
 
     def run_forever(self) -> None:
         logger.info("Starting session loop; press Ctrl+C to exit.")
@@ -103,6 +123,14 @@ class SessionController:
         except Exception as exc:
             logger.debug("Failed to send IDLE command: %s", exc)
 
+    def _reset_guidance_state(self) -> None:
+        self._last_orientation = None
+        self._last_bucket_eval = None
+        self._last_bucket_output = None
+        self._guidance.reset()
+        self._wander.reset()
+        self._near_mode = False
+
     def _start_session(self) -> None:
         dt = datetime.now(timezone.utc)
         planet = select_planet(dt)
@@ -110,12 +138,13 @@ class SessionController:
         self._state.active = True
         self._state.current_planet = planet
         self._state.target_vector = target_vec
+        self._state.guidance_target_vector = target_vec
         self._state.last_target_broadcast = 0.0
-        self._last_orientation = None
-        self._last_bucket_eval = None
-        self._last_bucket_output = None
+        self._reset_guidance_state()
         logger.info("Session start: target planet %s", planet.name.capitalize())
-        self._link.send_session_start(planet.name, self._audio.should_stream, self._state.cadence_sec)
+        # The firmware ticks at DEVICE_TICK_SEC; the host gates the spoken cadence
+        # itself (send DEVICE_TICK_SEC, not the prompt baseline).
+        self._link.send_session_start(planet.name, self._audio.should_stream, DEVICE_TICK_SEC)
         self._audio.play_intro(planet.name)
 
     def _end_session(self) -> None:
@@ -126,9 +155,7 @@ class SessionController:
         self._link.send_session_end()
         self._audio.play_outro()
         self._state = SessionState(cadence_sec=self._state.cadence_sec)
-        self._last_orientation = None
-        self._last_bucket_eval = None
-        self._last_bucket_output = None
+        self._reset_guidance_state()
         self._pending_tare = self._auto_tare
 
     def _tick(self) -> None:
@@ -136,7 +163,22 @@ class SessionController:
             return
         now = time.monotonic()
         if now - self._state.last_target_broadcast >= TARGET_BROADCAST_INTERVAL_SEC:
-            self._link.send_target_vector(self._state.target_vector)
+            true_vec = self._state.target_vector
+            if self._wander_enabled:
+                err = self._current_error_deg()
+                guidance_vec, offsets, scale = self._wander.step(true_vec, err, now)
+                logger.debug(
+                    "wander scale=%.2f off=(%.2f,%.2f) true=%s perturbed=%s",
+                    scale,
+                    offsets[0],
+                    offsets[1],
+                    true_vec,
+                    guidance_vec,
+                )
+            else:
+                guidance_vec = true_vec
+            self._state.guidance_target_vector = guidance_vec
+            self._link.send_target_vector(guidance_vec)
             self._state.last_target_broadcast = now
 
     def _process_tare(self, now: float) -> None:
@@ -161,10 +203,62 @@ class SessionController:
             return self._last_bucket_output
         if raw_label is None:
             return None
+        # No host label available (ORIENT was dropped this tick): fall back to the
+        # raw device label as a safety net. With body-centric guidance the device
+        # label may be body-incorrect, so surface it.
+        logger.warning(
+            "No host guidance label for this tick; using raw device label %r "
+            "(likely a dropped ORIENT line).",
+            raw_label,
+        )
         label = raw_label
         if not ALLOW_DIAGONAL_BUCKETS and label in _DIAGONAL_LABELS:
             label = _DIAGONAL_FALLBACK.get(label, label)
         return label
+
+    def _current_error_deg(self) -> float:
+        return buckets.decision_error_deg(self._last_bucket_eval)
+
+    def _update_near_mode(self, err_deg: float) -> None:
+        # Hysteresis so the cadence does not pump at the boundary.
+        if self._near_mode:
+            if err_deg > NEAR_EXIT_DEG:
+                self._near_mode = False
+        else:
+            if err_deg < NEAR_ENTER_DEG:
+                self._near_mode = True
+
+    def _prompt_interval(self, err_deg: float) -> float:
+        baseline = self._state.cadence_sec
+        if not self._near_mode:
+            return baseline
+        # Near the target, stretch the interval linearly from baseline (at NEAR_EXIT_DEG)
+        # up to NEAR_CADENCE_SCALE_MAX * baseline as err -> 0. Volume never changes;
+        # there is simply more space around each word.
+        t = _clamp(1.0 - err_deg / NEAR_EXIT_DEG, 0.0, 1.0)
+        scale = 1.0 + t * (NEAR_CADENCE_SCALE_MAX - 1.0)
+        return baseline * scale
+
+    def _handle_prompt_tick(self, bucket_label: Optional[str]) -> None:
+        """Speech gate: device ticks arrive fast; speak only on the stretched cadence."""
+        if bucket_label is None:
+            return
+        err = self._current_error_deg()
+        self._update_near_mode(err)
+        interval = self._prompt_interval(err)
+        now = time.monotonic()
+        if now - self._state.last_guidance_prompt < interval:
+            # Consume the tick silently; keep debug state fresh but do not speak.
+            logger.debug(
+                "Prompt tick gated (label=%s err=%.1f interval=%.2f)",
+                bucket_label,
+                err,
+                interval,
+            )
+            return
+        self._state.last_guidance_prompt = now
+        print(self._format_bucket_debug(bucket_label))
+        self._audio.play_bucket(bucket_label)
 
     def _poll_device(self) -> None:
         for message in self._link.read_messages():
@@ -211,34 +305,21 @@ class SessionController:
                     ),
                     "euler": euler,
                 }
-                if self._state.target_vector:
+                guidance_target = self._state.guidance_target_vector or self._state.target_vector
+                if guidance_target:
                     aim_vec = (
                         orientation.get("east", 0.0),
                         orientation.get("north", 0.0),
                         orientation.get("up", 0.0),
                     )
-                    decision = buckets.bucketize_direction(aim_vec, self._state.target_vector)
+                    decision = buckets.bucketize_direction(aim_vec, guidance_target, self._guidance)
                     self._last_bucket_eval = decision
                     self._last_bucket_output = self._compute_output_label_from_decision(decision)
 
-            bucket_label = None
             if bucket_label_raw:
+                # The device BUCKET line is only a tick now; the host owns the label.
                 bucket_label = self._resolve_bucket_label(bucket_label_raw)
-                print(self._format_bucket_debug(bucket_label))
-                self._audio.play_bucket(bucket_label)
-                decision = self._last_bucket_eval
-                expected = self._last_bucket_output
-                if not expected and decision:
-                    computed_label = self._compute_output_label_from_decision(decision)
-                    expected = computed_label
-                if decision and expected and bucket_label != expected:
-                    logger.debug(
-                        "Bucket mismatch (device=%s local=%s | yaw=%.2f pitch=%.2f)",
-                        bucket_label_raw,
-                        expected,
-                        decision.yaw_error_deg if decision else 0.0,
-                        decision.pitch_error_deg if decision else 0.0,
-                    )
+                self._handle_prompt_tick(bucket_label)
                 self._last_bucket_output = None
 
     def _abort_session(self) -> None:
@@ -251,9 +332,7 @@ class SessionController:
         except Exception as exc:
             logger.debug("Failed to send session end during abort: %s", exc)
         self._state = SessionState(cadence_sec=self._state.cadence_sec)
-        self._last_orientation = None
-        self._last_bucket_eval = None
-        self._last_bucket_output = None
+        self._reset_guidance_state()
         self._pending_tare = self._auto_tare
 
     def _shutdown(self, abort: bool = False) -> None:
@@ -264,7 +343,7 @@ class SessionController:
         self._send_idle_safe()
 
     def _format_bucket_debug(self, bucket_label: str) -> str:
-        target_vec = self._state.target_vector
+        target_vec = self._state.guidance_target_vector or self._state.target_vector
         orientation_data = self._last_orientation
         if not target_vec or not orientation_data:
             return f"[Bucket] {bucket_label}"
@@ -278,11 +357,13 @@ class SessionController:
         delta_az = _wrap_degrees(target_az - aim_az)
         delta_el = target_el - aim_el
 
-        yaw_pitch_hint = ""
-        if self._last_bucket_eval:
-            yaw_pitch_hint = (
-                f" | yaw_err={self._last_bucket_eval.yaw_error_deg:+.1f} "
-                f"pitch_err={self._last_bucket_eval.pitch_error_deg:+.1f}"
+        phase_hint = ""
+        eval_decision = self._last_bucket_eval
+        if eval_decision:
+            phase_hint = (
+                f" | phase={eval_decision.phase.upper()} "
+                f"dAz={eval_decision.d_az_deg:+.1f} dEl={eval_decision.d_el_deg:+.1f} "
+                f"err={buckets.decision_error_deg(eval_decision):.1f}"
             )
 
         return (
@@ -290,5 +371,5 @@ class SessionController:
             f"az={aim_az:.1f} el={aim_el:.1f} | "
             f"target az={target_az:.1f} el={target_el:.1f} | "
             f"dAz={delta_az:+.1f} dEl={delta_el:+.1f}"
-            f"{yaw_pitch_hint}"
+            f"{phase_hint}"
         )
